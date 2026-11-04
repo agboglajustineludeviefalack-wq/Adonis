@@ -24,7 +24,7 @@ HTML_CONTENT = """
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
         <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Autonome</h1>
-        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Live)</span>
+        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Déconnecté</span>
     </div>
 
     <!-- Tableau de Bord du Compte (Démo/Réel & Solde) -->
@@ -121,6 +121,9 @@ HTML_CONTENT = """
     }
 
     function initWebSocket(token) {
+        document.getElementById('connectionBadge').style.background = '#eab308';
+        document.getElementById('connectionBadge').innerText = "Connexion...";
+
         if (ws) ws.close();
         ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
 
@@ -130,15 +133,28 @@ HTML_CONTENT = """
 
         ws.onmessage = function(event) {
             const data = JSON.parse(event.data);
-            if (data.msg_type === 'authorize' && !data.error) {
-                baseBalance = parseFloat(data.authorize.balance);
-                const isVirtual = data.authorize.is_virtual;
-                document.getElementById('accountType').value = isVirtual ? 'demo' : 'real';
-                document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ " + (isVirtual ? "(Démo)" : "(Réel)");
+            if (data.msg_type === 'authorize') {
+                if (data.error) {
+                    alert("Erreur Token : " + data.error.message);
+                    document.getElementById('connectionBadge').style.background = '#ef4444';
+                    document.getElementById('connectionBadge').innerText = "Erreur Token";
+                } else {
+                    document.getElementById('connectionBadge').style.background = '#22c55e';
+                    document.getElementById('connectionBadge').innerText = "Connecté (Live)";
+                    baseBalance = parseFloat(data.authorize.balance);
+                    const isVirtual = data.authorize.is_virtual;
+                    document.getElementById('accountType').value = isVirtual ? 'demo' : 'real';
+                    document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ " + (isVirtual ? "(Démo)" : "(Réel)");
+                }
             }
             if (data.msg_type === 'tick') {
                 document.getElementById('livePrice').innerText = data.tick.quote.toFixed(2);
             }
+        };
+
+        ws.onerror = function() {
+            document.getElementById('connectionBadge').style.background = '#ef4444';
+            document.getElementById('connectionBadge').innerText = "Erreur Réseau";
         };
     }
 
@@ -180,12 +196,10 @@ HTML_CONTENT = """
         const isWin = profit >= 0;
         const statusLabel = isWin ? '<span style="color:#4ade80">🟢 GAGNÉ</span>' : '<span style="color:#ef4444">🔴 PERDU</span>';
 
-        // Mise à jour définitive du solde de base
         baseBalance += profit;
         const modeText = document.getElementById('accountType').value === 'demo' ? '(Démo)' : '(Réel)';
         document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ " + modeText;
 
-        // Ajout dans le Journal des Exécutions (Historique)
         const logContainer = document.getElementById('tradeLog');
         if (logContainer.innerHTML.includes('Aucun trade fermé')) {
             logContainer.innerHTML = '';
@@ -196,12 +210,10 @@ HTML_CONTENT = """
         logItem.innerHTML = `[${timeNow}] ${statusLabel} | Marché : <b>${activeTrade.asset}</b> | Lot : ${activeTrade.lot} | Résultat : <b style="color:${isWin ? '#4ade80':'#ef4444'}">${isWin ? '+' : ''}${profit.toFixed(2)} $</b>`;
         logContainer.prepend(logItem);
 
-        // Remise à zéro de la position active
         activeTrade = null;
-        document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l'évolution.</div>';
+        document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l\\'évolution.</div>';
     }
 
-    // Animation en temps réel du P&L et du solde
     setInterval(() => {
         if (!activeTrade) return;
 
