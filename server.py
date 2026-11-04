@@ -38,10 +38,10 @@ HTML_CONTENT = """
         <div class="row">
             <div class="col">
                 <label style="font-size: 11px; color: #94a3b8;">BROKER & TYPE</label>
-                <div id="brokerDisplay" style="font-family: monospace; font-size: 14px; color: #f59e0b; font-weight: bold; margin-top: 8px;">Deriv (Non connecté)</div>
+                <div id="brokerDisplay" style="font-family: monospace; font-size: 14px; color: #f59e0b; font-weight: bold; margin-top: 8px;">Non connecté</div>
             </div>
             <div class="col">
-                <label style="font-size: 11px; color: #94a3b8;">SOLDE EXACT</label>
+                <label style="font-size: 11px; color: #94a3b8;">SOLDE EXACT (DERIV)</label>
                 <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 6px;">-- $</div>
             </div>
         </div>
@@ -51,7 +51,7 @@ HTML_CONTENT = """
     <div class="card" id="configCard">
         <h3>🔑 Ajouter / Enregistrer une API :</h3>
         <input type="text" id="apiName" placeholder="Nom du compte (ex: Mon Compte Réel)..." style="margin-bottom: 8px;">
-        <input type="password" id="apitoken" placeholder="Colle ton token ici (Droits Read & Trade)...">
+        <input type="password" id="apitoken" placeholder="Colle ton token ici (Droits Trade & Account management)...">
         <button onclick="saveNewApi()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Sauvegarder et Connecter</button>
     </div>
 
@@ -107,24 +107,21 @@ HTML_CONTENT = """
     ];
     let scanIndex = 0;
 
-    // Fonction pour émettre un bip sonore d'alerte (Web Audio API)
+    // Alerte Sonore (Web Audio API)
     function playAlertSound() {
         try {
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const oscillator = audioCtx.createOscillator();
             const gainNode = audioCtx.createGain();
-            
             oscillator.type = 'sine';
-            oscillator.frequency.setValueAtTime(880, audioCtx.currentTime); // Note La (A5)
+            oscillator.frequency.setValueAtTime(880, audioCtx.currentTime);
             gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-            
             oscillator.connect(gainNode);
             gainNode.connect(audioCtx.destination);
-            
             oscillator.start();
-            oscillator.stop(audioCtx.currentTime + 0.3); // Bip court de 300ms
+            oscillator.stop(audioCtx.currentTime + 0.3);
         } catch (e) {
-            console.log("Audio non autorisé par le navigateur sans interaction préalable.");
+            console.log("Audio non autorisé sans interaction.");
         }
     }
 
@@ -158,21 +155,30 @@ HTML_CONTENT = """
         document.getElementById('apitoken').value = '';
         loadSavedApis();
         
-        document.getElementById('savedApiSelect').value = token;
+        // Sélectionner et connecter automatiquement le nouveau compte ajouté
+        select.value = token;
         initWebSocket(token);
     }
 
     function loadSelectedApi() {
-        const token = document.getElementById('savedApiSelect').value;
+        const select = document.getElementById('savedApiSelect');
+        const token = select.value;
         if (token) {
             document.getElementById('apitoken').value = token;
             initWebSocket(token);
+        } else {
+            document.getElementById('connectionBadge').style.background = '#eab308';
+            document.getElementById('connectionBadge').innerText = "En attente d'API";
+            document.getElementById('brokerDisplay').innerText = "Non connecté";
+            document.getElementById('accountBalance').innerText = "-- $";
+            document.getElementById('radarCard').style.display = 'none';
+            if (scannerInterval) clearInterval(scannerInterval);
         }
     }
 
     function initWebSocket(token) {
         document.getElementById('connectionBadge').style.background = '#eab308';
-        document.getElementById('connectionBadge').innerText = "Connexion...";
+        document.getElementById('connectionBadge').innerText = "Connexion Deriv...";
 
         if (ws) ws.close();
         
@@ -187,9 +193,10 @@ HTML_CONTENT = """
             
             if (data.msg_type === 'authorize') {
                 if (data.error) {
-                    alert("Erreur d'authentification : " + data.error.message);
+                    alert("Erreur d'authentification Deriv : " + data.error.message);
                     document.getElementById('connectionBadge').style.background = '#ef4444';
                     document.getElementById('connectionBadge').innerText = "Erreur Token";
+                    document.getElementById('brokerDisplay').innerText = "Token Invalide";
                 } else {
                     document.getElementById('connectionBadge').style.background = '#22c55e';
                     document.getElementById('connectionBadge').innerText = "Connecté (Live)";
@@ -215,7 +222,7 @@ HTML_CONTENT = """
 
         ws.onerror = function() {
             document.getElementById('connectionBadge').style.background = '#ef4444';
-            document.getElementById('connectionBadge').innerText = "Erreur Réseau";
+            document.getElementById('connectionBadge').innerText = "Erreur Réseau / Bloqué";
         };
     }
 
@@ -228,19 +235,15 @@ HTML_CONTENT = """
             document.getElementById('bestAsset').innerText = currentScan.symbol;
             document.getElementById('scanningText').innerText = "Analyse de " + currentScan.symbol + "...";
             
-            // Notification et Alerte Sonore dès qu'un setup est trouvé/actualisé
             playAlertSound();
             document.title = `🚨 SETUP A+ [${currentScan.symbol}]`;
-
-            setTimeout(() => {
-                document.title = "Adonis - Terminal Pro Multi-API";
-            }, 3000);
+            setTimeout(() => { document.title = "Adonis - Terminal Pro Multi-API"; }, 3000);
 
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ forget_all: 'ticks' }));
                 ws.send(JSON.stringify({ ticks: currentScan.ticker }));
             }
-        }, 10000);
+        }, 8000);
     }
 
     function executeTrade() {
@@ -256,6 +259,7 @@ HTML_CONTENT = """
             lot: lot,
             currentProfit: 0.00
         };
+        alert("Ordre prêt pour exécution semi-auto.");
     }
 
     function closeActiveTrade() {
@@ -284,7 +288,7 @@ HTML_CONTENT = """
         let fluctuation = (Math.random() - 0.48) * 1.5 * activeTrade.lot * 100;
         activeTrade.currentProfit += fluctuation;
 
-  const colorStyle = activeTrade.currentProfit >= 0 ? '#4ade80' : '#ef4444';
+        const colorStyle = activeTrade.currentProfit >= 0 ? '#4ade80' : '#ef4444';
         const statusText = activeTrade.currentProfit >= 0 ? 'EN GAIN (Vers TP)' : 'DRAWDOWN';
 
         document.getElementById('openPositions').innerHTML = `
