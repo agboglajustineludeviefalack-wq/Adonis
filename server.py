@@ -1,4 +1,6 @@
 import os
+import asyncio
+import aiohttp
 from aiohttp import web
 
 HTML_CONTENT = """
@@ -19,23 +21,42 @@ HTML_CONTENT = """
         .log-item { font-size: 12px; border-left: 3px solid #38bdf8; padding-left: 8px; margin-bottom: 8px; color: #cbd5e1; font-family: monospace; background: #111827; padding: 6px; border-radius: 4px; }
         @keyframes flash { 0% { background: #1a1c23; } 50% { background: #1e3a8a; } 100% { background: #1a1c23; } }
         .setup-alert { animation: flash 1s infinite; border: 1px solid #3b82f6; }
+        .btn { border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer; }
+        .btn-green { background: #28a745; color: white; }
+        .btn-blue { background: #2563eb; color: white; }
+        .btn-red { background: #ef4444; color: white; }
     </style>
 </head>
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
         <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Pro</h1>
-        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">En attente d'API</span>
+        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Déconnecté</span>
     </div>
 
-    <!-- Gestionnaire de Comptes / Liste des APIs Enregistrées -->
+    <!-- 1. Enregistrement d'une Nouvelle API (Séparé) -->
+    <div class="card">
+        <h3>📝 Enregistrer un Nouveau Compte</h3>
+        <input type="text" id="apiName" placeholder="Nom du compte (ex: Compte Réel Deriv)...">
+        <input type="password" id="apitoken" placeholder="Colle ton token ici (Droits Trade & Account management)...">
+        <button onclick="saveApiOnly()" class="btn btn-green">Sauvegarder le Compte</button>
+    </div>
+
+    <!-- 2. Sélection et Connexion / Déconnexion (Séparé) -->
     <div class="card" style="background: #111827; border: 1px solid #38bdf8;">
+        <h3>🔗 Pilotage de la Connexion</h3>
         <div style="margin-bottom: 10px;">
-            <label style="font-size: 11px; color: #94a3b8;">CHOISIR UN COMPTE ENREGISTRÉ</label>
-            <select id="savedApiSelect" onchange="loadSelectedApi()" style="margin-top: 5px; background: #1a1c23; color: #38bdf8; font-weight: bold;">
-                <option value="">-- Sélectionner un compte --</option>
+            <label style="font-size: 11px; color: #94a3b8;">COMPTES ENREGISTRÉS</label>
+            <select id="savedApiSelect" style="margin-top: 5px; background: #1a1c23; color: #38bdf8; font-weight: bold;">
+                <option value="">-- Aucun compte enregistré --</option>
             </select>
         </div>
-        <div class="row">
+        
+        <div class="row" style="margin-bottom: 10px;">
+            <button onclick="connectSelectedApi()" class="btn btn-blue">Se Connecter</button>
+            <button onclick="disconnectApi()" class="btn btn-red">Se Déconnecter</button>
+        </div>
+
+        <div class="row" style="margin-top: 15px; border-top: 1px solid #2a2e39; padding-top: 10px;">
             <div class="col">
                 <label style="font-size: 11px; color: #94a3b8;">BROKER & TYPE</label>
                 <div id="brokerDisplay" style="font-family: monospace; font-size: 14px; color: #f59e0b; font-weight: bold; margin-top: 8px;">Non connecté</div>
@@ -45,14 +66,6 @@ HTML_CONTENT = """
                 <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 6px;">-- $</div>
             </div>
         </div>
-    </div>
-
-    <!-- Ajout / Enregistrement d'une Nouvelle API -->
-    <div class="card" id="configCard">
-        <h3>🔑 Ajouter / Enregistrer une API :</h3>
-        <input type="text" id="apiName" placeholder="Nom du compte (ex: Mon Compte Réel)..." style="margin-bottom: 8px;">
-        <input type="password" id="apitoken" placeholder="Colle ton token ici (Droits Trade & Account management)...">
-        <button onclick="saveNewApi()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Sauvegarder et Connecter</button>
     </div>
 
     <!-- Radar Autonome avec Alerte Visuelle -->
@@ -73,7 +86,7 @@ HTML_CONTENT = """
             <input type="number" id="lotSize" value="0.01" step="0.01" min="0.01" style="background: #222; color: #4ade80; font-weight: bold;">
         </div>
 
-        <button onclick="executeTrade()" style="margin-top: 10px; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer;">Exécuter le Setup (Semi-Auto)</button>
+        <button onclick="executeTrade()" class="btn btn-blue" style="margin-top: 10px; font-size: 16px;">Exécuter le Setup (Semi-Auto)</button>
     </div>
 
     <!-- Suivi des Positions -->
@@ -107,7 +120,6 @@ HTML_CONTENT = """
     ];
     let scanIndex = 0;
 
-    // Alerte Sonore (Web Audio API)
     function playAlertSound() {
         try {
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -120,16 +132,19 @@ HTML_CONTENT = """
             gainNode.connect(audioCtx.destination);
             oscillator.start();
             oscillator.stop(audioCtx.currentTime + 0.3);
-        } catch (e) {
-            console.log("Audio non autorisé sans interaction.");
-        }
+        } catch (e) {}
     }
 
     function loadSavedApis() {
-        const apis = JSON.parse(localStorage.getItem('adonis_saved_apis') || '[]');
+        const apis = JSON.parse(localStorage.getItem('adonis_clean_accounts') || '[]');
         const select = document.getElementById('savedApiSelect');
         select.innerHTML = '<option value="">-- Sélectionner un compte --</option>';
         
+        if (apis.length === 0) {
+            select.innerHTML = '<option value="">-- Aucun compte enregistré --</option>';
+            return;
+        }
+
         apis.forEach((item) => {
             const opt = document.createElement('option');
             opt.value = item.token;
@@ -138,7 +153,8 @@ HTML_CONTENT = """
         });
     }
 
-    function saveNewApi() {
+    // 1. Sauvegarde pure (SANS connexion automatique, avec anti-doublon strict)
+    function saveApiOnly() {
         const name = document.getElementById('apiName').value.trim();
         const token = document.getElementById('apitoken').value.trim();
 
@@ -147,42 +163,57 @@ HTML_CONTENT = """
             return;
         }
 
-        let apis = JSON.parse(localStorage.getItem('adonis_saved_apis') || '[]');
+        let apis = JSON.parse(localStorage.getItem('adonis_clean_accounts') || '[]');
+
+        const existingIndex = apis.findIndex(item => item.token === token || item.name.toLowerCase() === name.toLowerCase());
+        
+        if (existingIndex !== -1) {
+            alert("Ce compte ou ce token est déjà enregistré dans ta liste ! Impossible de le sauvegarder deux fois.");
+            return;
+        }
+
         apis.push({ name: name, token: token });
-        localStorage.setItem('adonis_saved_apis', JSON.stringify(apis));
+        localStorage.setItem('adonis_clean_accounts', JSON.stringify(apis));
 
         document.getElementById('apiName').value = '';
         document.getElementById('apitoken').value = '';
         loadSavedApis();
-        
-        // Sélectionner et connecter automatiquement le nouveau compte ajouté
-        select.value = token;
+        alert("Compte sauvegardé avec succès !");
+    }
+
+    // 2. Connexion manuelle via le bouton dédié
+    function connectSelectedApi() {
+        const select = document.getElementById('savedApiSelect');
+        const token = select.value;
+        if (!token) {
+            alert("Veuillez d'abord sélectionner un compte dans la liste !");
+            return;
+        }
         initWebSocket(token);
     }
 
-    function loadSelectedApi() {
-        const select = document.getElementById('savedApiSelect');
-        const token = select.value;
-        if (token) {
-            document.getElementById('apitoken').value = token;
-            initWebSocket(token);
-        } else {
-            document.getElementById('connectionBadge').style.background = '#eab308';
-            document.getElementById('connectionBadge').innerText = "En attente d'API";
-            document.getElementById('brokerDisplay').innerText = "Non connecté";
-            document.getElementById('accountBalance').innerText = "-- $";
-            document.getElementById('radarCard').style.display = 'none';
-            if (scannerInterval) clearInterval(scannerInterval);
-        }
+    // 3. Déconnexion manuelle
+    function disconnectApi() {
+        if (ws) ws.close();
+        if (scannerInterval) clearInterval(scannerInterval);
+        
+        document.getElementById('connectionBadge').style.background = '#eab308';
+        document.getElementById('connectionBadge').innerText = "Déconnecté";
+        document.getElementById('brokerDisplay').innerText = "Non connecté";
+        document.getElementById('accountBalance').innerText = "-- $";
+        document.getElementById('radarCard').style.display = 'none';
+        document.getElementById('savedApiSelect').value = "";
+        alert("Déconnecté avec succès.");
     }
 
     function initWebSocket(token) {
         document.getElementById('connectionBadge').style.background = '#eab308';
-        document.getElementById('connectionBadge').innerText = "Connexion Deriv...";
+        document.getElementById('connectionBadge').innerText = "Connexion Proxy...";
 
         if (ws) ws.close();
         
-        ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        ws = new WebSocket(protocol + window.location.host + '/ws');
 
         ws.onopen = function() {
             ws.send(JSON.stringify({ authorize: token }));
@@ -222,7 +253,7 @@ HTML_CONTENT = """
 
         ws.onerror = function() {
             document.getElementById('connectionBadge').style.background = '#ef4444';
-            document.getElementById('connectionBadge').innerText = "Erreur Réseau / Bloqué";
+            document.getElementById('connectionBadge').innerText = "Erreur Réseau / Proxy";
         };
     }
 
@@ -295,7 +326,7 @@ HTML_CONTENT = """
             <b>Marché :</b> ${activeTrade.asset}<br>
             <b>Lot :</b> ${activeTrade.lot} | <b>Statut :</b> <span style="color:${colorStyle}">${statusText}</span><br>
             <b>P&L Flottant :</b> <span style="color:${colorStyle}; font-size:16px;">${activeTrade.currentProfit >= 0 ? '+' : ''}${activeTrade.currentProfit.toFixed(2)} $</span><br>
-            <button onclick="closeActiveTrade()" style="margin-top: 10px; background: #ef4444; color: white; border: none; padding: 8px; border-radius: 4px; width: 100%; font-weight: bold; cursor: pointer;">Clôturer le Trade</button>
+            <button onclick="closeActiveTrade()" class="btn btn-red" style="margin-top: 10px; padding: 8px;">Clôturer le Trade</button>
         `;
 
         let liveTotalBalance = baseBalance + activeTrade.currentProfit;
@@ -303,6 +334,8 @@ HTML_CONTENT = """
     }, 1000);
 
     window.onload = function() {
+        // Nettoyage complet des anciens stocks pour repartir à zéro
+        localStorage.removeItem('adonis_saved_apis');
         loadSavedApis();
     };
     </script>
@@ -313,8 +346,42 @@ HTML_CONTENT = """
 async def handle(request):
     return web.Response(text=HTML_CONTENT, content_type='text/html')
 
+async def websocket_proxy(request):
+    ws_server = web.WebSocketResponse()
+    await ws_server.prepare(request)
+
+    deriv_url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.ws_connect(deriv_url) as ws_deriv:
+                async def browser_to_deriv():
+                    async for msg in ws_server:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await ws_deriv.send_str(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            break
+
+                async def deriv_to_browser():
+                    async for msg in ws_deriv:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await ws_server.send_str(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            break
+
+                done, pending = await asyncio.wait(
+                    [asyncio.create_task(browser_to_deriv()), asyncio.create_task(deriv_to_browser())],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+        except Exception as e:
+            print(f"Erreur du proxy WebSocket : {e}")
+
+    return ws_server
+
 app = web.Application()
 app.router.add_get('/', handle)
+app.router.add_get('/ws', websocket_proxy)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
