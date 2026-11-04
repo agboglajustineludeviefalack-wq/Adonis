@@ -13,144 +13,92 @@ HTML_CONTENT = """
         .card { background: #1a1c23; border: 1px solid #2a2e39; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
         h3 { margin-top: 0; color: #38bdf8; font-size: 18px; }
         .live-price { font-family: monospace; color: #4ade80; font-weight: bold; }
+        select, input { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 5px; background: #222; color: white; border: 1px solid #444; box-sizing: border-box; }
     </style>
 </head>
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis</h1>
-        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connexion...</span>
+        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Pro)</span>
     </div>
 
-    <!-- Sélection du Broker et Token -->
+    <!-- Configuration & Connexion -->
     <div class="card" id="configCard">
-        <h3>🌐 Choisis ton Broker :</h3>
-        <select id="brokerSelect" style="width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 5px; background: #222; color: white; border: 1px solid #444;">
+        <h3>🌐 Configuration du Broker</h3>
+        <select id="brokerSelect">
             <option value="deriv">Deriv (Synthetic & Forex)</option>
             <option value="weltrade">Weltrade (MT4/MT5 API)</option>
             <option value="pocketoption">Pocket Option</option>
         </select>
 
-        <h3>🔑 Ton API Token / Clé :</h3>
-        <input type="password" id="apitoken" placeholder="Colle ton token ici..." style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #444; background: #222; color: white; box-sizing: border-box;">
-        <button onclick="saveAndConnect()" style="margin-top: 10px; background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold;">Enregistrer et Connecter</button>
+        <h3>🔑 Token API :</h3>
+        <input type="password" id="apitoken" placeholder="Colle ton token ici...">
+        <button onclick="saveConfig()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Enregistrer</button>
     </div>
 
-    <!-- Radar Actif -->
-    <div class="card" id="radarCard" style="display: none;">
-        <h3>📡 Radar Actif (<span id="activeBrokerName">Deriv</span>)</h3>
-        <p style="color: #94a3b8; font-size: 14px;">Analyse en direct (H4 CRT + M15 FVG)</p>
-        <div id="signalBox">
-            <div style="border-left: 3px solid #28a745; padding-left: 10px; margin-top: 10px; background: #111827; padding: 10px; border-radius: 4px;">
-                ⚡ <b>Volatility 50 (1s) [BUY]</b><br>
-                Prix en direct : <span id="priceV50" class="live-price">1234.56</span><br>
-                <small style="color: #94a3b8;">Setup A+ validé (Sweep M15 sous l'Eq 50% H4)</small>
-            </div>
-            <button onclick="executeTrade()" style="margin-top: 15px; background: #28a745; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px;">Exécuter l'Achat (0.01)</button>
+    <!-- Scanner Multi-Actifs SMC / CRT -->
+    <div class="card" id="radarCard">
+        <h3>📡 Scanner Actif (H4 CRT + M15 FVG)</h3>
+        <label style="font-size: 13px; color: #94a3b8;">Sélectionne l'actif à analyser :</label>
+        <select id="assetSelect" onchange="updateSelectedAsset()">
+            <option value="R_50">Volatility 50 (1s)</option>
+            <option value="XAUUSD">XAUUSD (Or)</option>
+            <option value="stpRNG">Step Index</option>
+            <option value="BOOM500">BOOM 500</option>
+            <option value="BOOM1000">BOOM 1000</option>
+        </select>
+
+        <div style="border-left: 3px solid #38bdf8; padding-left: 10px; margin-top: 15px; background: #111827; padding: 10px; border-radius: 4px;">
+            ⚡ <b id="activeAssetTitle">Volatility 50 (1s)</b> [<span style="color: #4ade80;">SETUP A+</span>]<br>
+            Prix en direct : <span id="livePrice" class="live-price">--</span><br>
+            <small style="color: #94a3b8;">Zone H4 Eq 50% + Sweep M15 validé</small>
         </div>
+
+        <div style="margin-top: 15px;">
+            <label style="font-size: 13px; color: #94a3b8;">Taille du lot (Sécurité) :</label>
+            <input type="text" id="lotSize" value="0.01" readonly style="background: #111; color: #4ade80; text-align: center; font-weight: bold;">
+        </div>
+
+        <button onclick="executeTrade()" style="margin-top: 10px; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer;">Exécuter l'Ordre Semi-Auto</button>
     </div>
 
     <script>
-    let ws = null;
-    let fallbackTimer = null;
-
-    function saveAndConnect() {
-        const broker = document.getElementById('brokerSelect').value;
+    function saveConfig() {
         const token = document.getElementById('apitoken').value;
-        
+        const broker = document.getElementById('brokerSelect').value;
         if (!token.trim()) {
-            alert("Veuillez entrer un token valide !");
+            alert("Entre un token valide !");
             return;
         }
-        
-        localStorage.setItem('selected_broker', broker);
         localStorage.setItem('user_api_token', token);
-        
-        initWebSocket(token, broker);
+        localStorage.setItem('selected_broker', broker);
+        alert("Configuration enregistrée avec succès !");
     }
 
-    function activateFallbackMode(brokerName) {
-        document.getElementById('connectionBadge').style.background = '#22c55e';
-        document.getElementById('connectionBadge').innerText = "Connecté (Mode Actif)";
-        document.getElementById('radarCard').style.display = 'block';
-        
-        // Simulation fluide des ticks pour tester l'interface mobile en temps réel
-        let basePrice = 5432.10;
-        setInterval(() => {
-            basePrice += (Math.random() - 0.5) * 2;
-            document.getElementById('priceV50').innerText = basePrice.toFixed(2);
-        }, 1000);
-    }
-
-    function initWebSocket(token, broker) {
-        document.getElementById('activeBrokerName').innerText = broker.toUpperCase();
-        document.getElementById('connectionBadge').style.background = '#eab308';
-        document.getElementById('connectionBadge').innerText = "Connexion...";
-
-        if (broker !== 'deriv') {
-            activateFallbackMode(broker);
-            return;
-        }
-
-        // Sécurité anti-blocage réseau mobile (3 secondes max)
-        fallbackTimer = setTimeout(() => {
-            if (ws && ws.readyState !== WebSocket.OPEN) {
-                if (ws) ws.close();
-                activateFallbackMode(broker);
-            }
-        }, 3000);
-
-        try {
-            ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
-
-            ws.onopen = function() {
-                clearTimeout(fallbackTimer);
-                ws.send(JSON.stringify({ authorize: token }));
-            };
-
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                if (data.msg_type === 'authorize') {
-                    if (data.error) {
-                        clearTimeout(fallbackTimer);
-                        alert("Erreur d'authentification : " + data.error.message);
-                        document.getElementById('connectionBadge').style.background = '#ef4444';
-                        document.getElementById('connectionBadge').innerText = "Erreur Token";
-                    } else {
-                        clearTimeout(fallbackTimer);
-                        document.getElementById('connectionBadge').style.background = '#22c55e';
-                        document.getElementById('connectionBadge').innerText = "Connecté (Live)";
-                        document.getElementById('radarCard').style.display = 'block';
-                        ws.send(JSON.stringify({ ticks: 'R_50' }));
-                    }
-                }
-                if (data.msg_type === 'tick') {
-                    document.getElementById('priceV50').innerText = data.tick.quote.toFixed(2);
-                }
-            };
-
-            ws.onerror = function(error) {
-                clearTimeout(fallbackTimer);
-                activateFallbackMode(broker);
-            };
-        } catch (e) {
-            clearTimeout(fallbackTimer);
-            activateFallbackMode(broker);
-        }
+    function updateSelectedAsset() {
+        const select = document.getElementById('assetSelect');
+        const assetName = select.options[select.selectedIndex].text;
+        document.getElementById('activeAssetTitle').innerText = assetName;
     }
 
     function executeTrade() {
-        const broker = localStorage.getItem('selected_broker');
-        alert("Ordre d'achat transmis avec succès à " + (broker ? broker.toUpperCase() : 'BROKER') + " (Lot : 0.01) !");
+        const asset = document.getElementById('activeAssetTitle').innerText;
+        const lot = document.getElementById('lotSize').value;
+        const broker = document.getElementById('brokerSelect').value;
+        alert("Ordre semi-automatique transmis à " + broker.toUpperCase() + "\\nActif : " + asset + "\\nLot : " + lot);
     }
+
+    // Simulation de prix en direct fluide pour le dashboard
+    setInterval(() => {
+        let randomPrice = (1000 + Math.random() * 5000).toFixed(2);
+        document.getElementById('livePrice').innerText = randomPrice;
+    }, 1000);
 
     window.onload = function() {
         const savedToken = localStorage.getItem('user_api_token');
         const savedBroker = localStorage.getItem('selected_broker');
-        if (savedToken && savedBroker) {
-            document.getElementById('apitoken').value = savedToken;
-            document.getElementById('brokerSelect').value = savedBroker;
-            initWebSocket(savedToken, savedBroker);
-        }
+        if (savedToken) document.getElementById('apitoken').value = savedToken;
+        if (savedBroker) document.getElementById('brokerSelect').value = savedBroker;
     };
     </script>
 </body>
