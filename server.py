@@ -63,7 +63,7 @@ HTML_CONTENT = """
         <select id="assetSelect" onchange="updateSelectedAsset()">
             <option value="R_50">Volatility 50 (1s)</option>
             <option value="R_100">Volatility 100</option>
-            <option value="XAUUSD">XAUUSD (Or)</option>
+            <option value="XAUUSD" selected>XAUUSD (Or)</option>
             <option value="stpRNG">Step Index</option>
             <option value="BOOM500">BOOM 500</option>
             <option value="BOOM1000">BOOM 1000</option>
@@ -71,7 +71,7 @@ HTML_CONTENT = """
         </select>
 
         <div style="border-left: 3px solid #38bdf8; padding-left: 10px; margin-top: 15px; background: #111827; padding: 10px; border-radius: 4px;">
-            ⚡ <b id="activeAssetTitle">Volatility 50 (1s)</b> [<span style="color: #4ade80;">SETUP A+</span>]<br>
+            ⚡ <b id="activeAssetTitle">XAUUSD (Or)</b> [<span style="color: #4ade80;">SETUP A+</span>]<br>
             Prix en direct : <span id="livePrice" class="live-price">--</span><br>
             <small style="color: #94a3b8;">Zone H4 Eq 50% + Sweep M15 validé</small>
         </div>
@@ -93,8 +93,6 @@ HTML_CONTENT = """
     </div>
 
     <script>
-    let ws = null;
-
     function saveConfig() {
         const token = document.getElementById('apitoken').value;
         const broker = document.getElementById('brokerSelect').value;
@@ -104,7 +102,6 @@ HTML_CONTENT = """
         }
         localStorage.setItem('user_api_token', token);
         localStorage.setItem('selected_broker', broker);
-        document.getElementById('connectionBadge.style.background = '#22c55e';
         alert("Configuration et token enregistrés avec succès !");
     }
 
@@ -131,7 +128,6 @@ HTML_CONTENT = """
         const account = document.getElementById('accountType').value.toUpperCase();
         const timeNow = new Date().toLocaleTimeString();
 
-        // Ajout dans le journal d'historique
         const logContainer = document.getElementById('tradeLog');
         if (logContainer.innerHTML.includes('Aucun ordre')) {
             logContainer.innerHTML = '';
@@ -145,7 +141,7 @@ HTML_CONTENT = """
         alert("Ordre semi-automatique transmis avec succès !\\nActif : " + asset + "\\nLot : " + lot + "\\nCompte : " + account);
     }
 
-    // Simulation fluide des prix en direct pour le dashboard multi-actifs
+    // Simulation fluide des prix en direct
     setInterval(() => {
         let randomPrice = (1000 + Math.random() * 5000).toFixed(2);
         document.getElementById('livePrice').innerText = randomPrice;
@@ -156,6 +152,7 @@ HTML_CONTENT = """
         const savedBroker = localStorage.getItem('selected_broker');
         if (savedToken) document.getElementById('apitoken').value = savedToken;
         if (savedBroker) document.getElementById('brokerSelect').value = savedBroker;
+        updateSelectedAsset();
     };
     </script>
 </body>
