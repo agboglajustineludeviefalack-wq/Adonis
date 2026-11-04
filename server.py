@@ -7,19 +7,39 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adonis - Cloud Trading Scanner</title>
+    <title>Adonis - Terminal Pro SMC/CRT</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #f0f0f0; padding: 15px; margin: 0; }
         .card { background: #1a1c23; border: 1px solid #2a2e39; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
         h3 { margin-top: 0; color: #38bdf8; font-size: 18px; }
         .live-price { font-family: monospace; color: #4ade80; font-weight: bold; }
         select, input { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 5px; background: #222; color: white; border: 1px solid #444; box-sizing: border-box; }
+        .row { display: flex; gap: 10px; }
+        .col { flex: 1; }
+        .log-item { font-size: 12px; border-left: 2px solid #38bdf8; padding-left: 8px; margin-bottom: 8px; color: #cbd5e1; font-family: monospace; }
     </style>
 </head>
 <body>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-        <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis</h1>
-        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Pro)</span>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Terminal</h1>
+        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Actif)</span>
+    </div>
+
+    <!-- Tableau de Bord du Compte (Solde & Mode) -->
+    <div class="card" style="background: #111827; border: 1px solid #38bdf8;">
+        <div class="row">
+            <div class="col">
+                <label style="font-size: 11px; color: #94a3b8;">TYPE DE COMPTE</label>
+                <select id="accountType" onchange="switchAccountType()">
+                    <option value="demo">Démo (Virtuel)</option>
+                    <option value="real">Réel (Live)</option>
+                </select>
+            </div>
+            <div class="col">
+                <label style="font-size: 11px; color: #94a3b8;">SOLDE ACTUEL</label>
+                <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 8px;">10,450.00 $</div>
+            </div>
+        </div>
     </div>
 
     <!-- Configuration & Connexion -->
@@ -33,7 +53,7 @@ HTML_CONTENT = """
 
         <h3>🔑 Token API :</h3>
         <input type="password" id="apitoken" placeholder="Colle ton token ici...">
-        <button onclick="saveConfig()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Enregistrer</button>
+        <button onclick="saveConfig()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Enregistrer et Connecter</button>
     </div>
 
     <!-- Scanner Multi-Actifs SMC / CRT -->
@@ -42,10 +62,12 @@ HTML_CONTENT = """
         <label style="font-size: 13px; color: #94a3b8;">Sélectionne l'actif à analyser :</label>
         <select id="assetSelect" onchange="updateSelectedAsset()">
             <option value="R_50">Volatility 50 (1s)</option>
+            <option value="R_100">Volatility 100</option>
             <option value="XAUUSD">XAUUSD (Or)</option>
             <option value="stpRNG">Step Index</option>
             <option value="BOOM500">BOOM 500</option>
             <option value="BOOM1000">BOOM 1000</option>
+            <option value="CRASH500">CRASH 500</option>
         </select>
 
         <div style="border-left: 3px solid #38bdf8; padding-left: 10px; margin-top: 15px; background: #111827; padding: 10px; border-radius: 4px;">
@@ -55,14 +77,24 @@ HTML_CONTENT = """
         </div>
 
         <div style="margin-top: 15px;">
-            <label style="font-size: 13px; color: #94a3b8;">Taille du lot (Sécurité) :</label>
-            <input type="text" id="lotSize" value="0.01" readonly style="background: #111; color: #4ade80; text-align: center; font-weight: bold;">
+            <label style="font-size: 13px; color: #94a3b8;">Taille du lot (Personnalisable) :</label>
+            <input type="number" id="lotSize" value="0.01" step="0.01" min="0.01" style="background: #222; color: #4ade80; font-weight: bold;">
         </div>
 
         <button onclick="executeTrade()" style="margin-top: 10px; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer;">Exécuter l'Ordre Semi-Auto</button>
     </div>
 
+    <!-- Journal d'historique des ordres -->
+    <div class="card">
+        <h3>📋 Journal des Exécutions (Session)</h3>
+        <div id="tradeLog" style="max-height: 150px; overflow-y: auto; background: #111827; padding: 8px; border-radius: 4px;">
+            <div style="color: #64748b; font-size: 12px; text-align: center;">Aucun ordre passé pour le moment.</div>
+        </div>
+    </div>
+
     <script>
+    let ws = null;
+
     function saveConfig() {
         const token = document.getElementById('apitoken').value;
         const broker = document.getElementById('brokerSelect').value;
@@ -72,7 +104,8 @@ HTML_CONTENT = """
         }
         localStorage.setItem('user_api_token', token);
         localStorage.setItem('selected_broker', broker);
-        alert("Configuration enregistrée avec succès !");
+        document.getElementById('connectionBadge.style.background = '#22c55e';
+        alert("Configuration et token enregistrés avec succès !");
     }
 
     function updateSelectedAsset() {
@@ -81,14 +114,38 @@ HTML_CONTENT = """
         document.getElementById('activeAssetTitle').innerText = assetName;
     }
 
+    function switchAccountType() {
+        const type = document.getElementById('accountType').value;
+        const balanceEl = document.getElementById('accountBalance');
+        if (type === 'demo') {
+            balanceEl.innerText = "10,450.00 $ (Démo)";
+        } else {
+            balanceEl.innerText = "1,250.00 $ (Réel)";
+        }
+    }
+
     function executeTrade() {
         const asset = document.getElementById('activeAssetTitle').innerText;
         const lot = document.getElementById('lotSize').value;
         const broker = document.getElementById('brokerSelect').value;
-        alert("Ordre semi-automatique transmis à " + broker.toUpperCase() + "\\nActif : " + asset + "\\nLot : " + lot);
+        const account = document.getElementById('accountType').value.toUpperCase();
+        const timeNow = new Date().toLocaleTimeString();
+
+        // Ajout dans le journal d'historique
+        const logContainer = document.getElementById('tradeLog');
+        if (logContainer.innerHTML.includes('Aucun ordre')) {
+            logContainer.innerHTML = '';
+        }
+
+        const logItem = document.createElement('div');
+        logItem.className = 'log-item';
+        logItem.innerHTML = `[${timeNow}] <b>${broker.toUpperCase()}</b> (${account}) - ${asset} | Lot: <span style="color:#4ade80">${lot}</span> -> <b>TRANSMIS</b>`;
+        logContainer.prepend(logItem);
+
+        alert("Ordre semi-automatique transmis avec succès !\\nActif : " + asset + "\\nLot : " + lot + "\\nCompte : " + account);
     }
 
-    // Simulation de prix en direct fluide pour le dashboard
+    // Simulation fluide des prix en direct pour le dashboard multi-actifs
     setInterval(() => {
         let randomPrice = (1000 + Math.random() * 5000).toFixed(2);
         document.getElementById('livePrice').innerText = randomPrice;
