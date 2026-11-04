@@ -35,14 +35,14 @@ HTML_CONTENT = """
         <button onclick="saveAndConnect()" style="margin-top: 10px; background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold;">Enregistrer et Connecter</button>
     </div>
 
-    <!-- Radar Actif (Caché par défaut) -->
+    <!-- Radar Actif (Caché tant que l'API n'a pas validé la connexion) -->
     <div class="card" id="radarCard" style="display: none;">
         <h3>📡 Radar Actif (<span id="activeBrokerName">Deriv</span>)</h3>
-        <p style="color: #94a3b8; font-size: 14px;">Flux WebSocket en direct (H4 CRT + M15 FVG)</p>
+        <p style="color: #94a3b8; font-size: 14px;">Analyse en direct (H4 CRT + M15 FVG)</p>
         <div id="signalBox">
             <div style="border-left: 3px solid #28a745; padding-left: 10px; margin-top: 10px; background: #111827; padding: 10px; border-radius: 4px;">
                 ⚡ <b>Volatility 50 (1s) [BUY]</b><br>
-                Prix en direct : <span id="priceV50" class="live-price">Connexion...</span><br>
+                Prix en direct : <span id="priceV50" class="live-price">Chargement...</span><br>
                 <small style="color: #94a3b8;">Setup A+ validé (Sweep M15 sous l'Eq 50% H4)</small>
             </div>
             <button onclick="executeTrade()" style="margin-top: 15px; background: #28a745; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px;">Exécuter l'Achat (0.01)</button>
@@ -70,13 +70,12 @@ HTML_CONTENT = """
     function initWebSocket(token, broker) {
         if (broker === 'deriv') {
             document.getElementById('activeBrokerName').innerText = "Deriv";
-            document.getElementById('radarCard').style.display = 'block';
             
-            // Connexion au WebSocket officiel Deriv (App ID public de test/démo)
+            // Connexion au WebSocket officiel Deriv
             ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
 
             ws.onopen = function() {
-                console.log("WebSocket connecté, envoi de l'autorisation...");
+                console.log("WebSocket ouvert, envoi de l'autorisation...");
                 ws.send(JSON.stringify({ authorize: token }));
             };
 
@@ -87,11 +86,15 @@ HTML_CONTENT = """
                     if (data.error) {
                         alert("Erreur d'authentification : " + data.error.message);
                         document.getElementById('connectionBadge').style.background = '#ef4444';
-                        document.getElementById('connectionBadge').innerText = "Erreur Token";
+                        document.getElementById('connectionBadge').innerText = "Déconnecté";
+                        document.getElementById('radarCard').style.display = 'none';
                     } else {
+                        // Succès de l'authentification ! On affiche le badge vert et le radar
                         document.getElementById('connectionBadge').style.background = '#22c55e';
                         document.getElementById('connectionBadge').innerText = "Connecté (Live)";
-                        // S'abonner aux ticks du Volatility 50 (R_50)
+                        document.getElementById('radarCard').style.display = 'block';
+                        
+                        // Demande des ticks pour l'actif
                         ws.send(JSON.stringify({ ticks: 'R_50' }));
                     }
                 }
@@ -104,12 +107,11 @@ HTML_CONTENT = """
 
             ws.onerror = function(error) {
                 console.error("Erreur WebSocket:", error);
+                document.getElementById('connectionBadge').style.background = '#ef4444';
+                document.getElementById('connectionBadge').innerText = "Erreur Réseau";
             };
         } else {
-            alert("Connexion pour ce broker en cours d'intégration. Mode simulation actif.");
-            document.getElementById('radarCard').style.display = 'block';
-            document.getElementById('connectionBadge').style.background = '#eab308';
-            document.getElementById('connectionBadge').innerText = "Mode Simulé";
+            alert("Broker non pris en charge pour l'instant.");
         }
     }
 
@@ -118,7 +120,7 @@ HTML_CONTENT = """
         alert("Ordre d'achat transmis avec succès à " + broker.toUpperCase() + " !");
     }
 
-    // Chargement automatique si le token est déjà mémorisé
+    // Connexion automatique au chargement si un token est déjà enregistré
     window.onload = function() {
         const savedToken = localStorage.getItem('user_api_token');
         const savedBroker = localStorage.getItem('selected_broker');
