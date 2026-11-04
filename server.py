@@ -4,8 +4,10 @@ import json
 import time
 import html
 import base64
+import asyncio
 import hashlib
 import secrets
+from collections import deque
 from urllib.parse import urlencode
 
 import aiohttp
@@ -14,7 +16,9 @@ from aiohttp import web
 # ------------------------------------------------------------------
 # CONFIGURATION (variables à mettre dans Railway > Variables)
 #   DERIV_APP_ID : l'ID de ton application sur developers.deriv.com
+#   NTFY_TOPIC   : le nom secret de ton canal d'alertes ntfy
 #   PUBLIC_URL   : (optionnel) l'adresse publique de ton site Railway
+#   SCAN_SYMBOLS : (optionnel) marchés à scanner, séparés par des virgules
 # ------------------------------------------------------------------
 APP_ID = os.environ.get("DERIV_APP_ID", "").strip()
 PUBLIC_URL = os.environ.get(
@@ -25,13 +29,35 @@ REDIRECT_URI = PUBLIC_URL + "/callback"
 AUTH_URL = "https://auth.deriv.com/oauth2/auth"
 TOKEN_URL = "https://auth.deriv.com/oauth2/token"
 API_BASE = "https://api.derivws.com"
+PUBLIC_WS = os.environ.get(
+    "DERIV_PUBLIC_WS", "wss://api.derivws.com/trading/v1/options/ws/public"
+)
 
 TIMEOUT = aiohttp.ClientTimeout(total=20)
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# --- Scanner ---
+_raw_topic = os.environ.get("NTFY_TOPIC", "").strip()
+NTFY_TOPIC = _raw_topic if re.match(r"^[A-Za-z0-9_-]{8,64}$", _raw_topic) else ""
+SYMBOLS = [
+    s.strip()
+    for s in os.environ.get(
+        "SCAN_SYMBOLS", "frxXAUUSD,R_50,stpRNG,BOOM500,CRASH500"
+    ).split(",")
+    if s.strip()
+]
+SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté d'un sommet/creux
+MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
+EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))   # tolérance des Equal Highs/Lows (0.05 %)
+SCAN_EVERY = int(os.environ.get("SCAN_EVERY", "60"))  # secondes entre deux analyses
+
 # Mémoire du serveur (se vide si Railway redémarre : il faudra se reconnecter)
 SESSIONS = {}  # sid -> {"token": ..., "exp": ...}
 PENDING = {}   # state -> {"verifier": ..., "ts": ...}
+
+STATE = {"last": None, "error": None, "symbols": {}, "available": []}
+SIGNALS = deque(maxlen=30)
+SENT = set()
 
 
 HTML_CONTENT = r"""
@@ -70,6 +96,16 @@ HTML_CONTENT = r"""
     <a class="btn btn-blue" href="/login">Se connecter avec Deriv</a>
   </div>
 
+  <div class="card" id="scanCard" style="display:none;">
+    <h3>🛰️ Scanner (tourne sur le serveur)</h3>
+    <div id="scanMeta" class="small" style="margin-bottom:8px;"></div>
+    <div id="scanList"></div>
+    <details style="margin-top:10px;">
+      <summary class="small">Marchés disponibles chez Deriv</summary>
+      <pre id="scanSymbols"></pre>
+    </details>
+  </div>
+
   <div class="card" id="accountCard" style="display:none;">
     <h3>🔗 Compte & Connexion</h3>
     <label class="small">COMPTE</label>
@@ -99,7 +135,7 @@ HTML_CONTENT = r"""
     <h3>📡 Marché en direct</h3>
     <select id="marketSelect" onchange="subscribeTicker()"></select>
     <div>Prix : <span id="livePrice" class="live-price">--</span></div>
-    <p class="small">Aucune analyse n'est codée pour l'instant : cette zone affiche seulement le prix. Le setup A+ viendra quand on aura écrit tes règles.</p>
+    <p class="small">Cette zone affiche seulement le prix. L'analyse A+ est faite par le scanner du serveur (carte ci-dessus).</p>
   </div>
 
   <div class="card">
@@ -161,6 +197,33 @@ function subscribeTicker() {
   send({ ticks: $("marketSelect").value, subscribe: 1 });
 }
 
+async function loadScanner() {
+  let r;
+  try { r = await fetch("/api/scanner"); } catch (e) { return; }
+  if (r.status === 401) return;
+  const j = await r.json();
+  $("scanCard").style.display = "block";
+  const when = j.derniere_analyse ? new Date(j.derniere_analyse * 1000).toLocaleTimeString() : "pas encore";
+  $("scanMeta").textContent = "Dernière analyse : " + when + " · alertes ntfy : " + (j.ntfy ? "actives" : "NON configurées") + (j.erreur ? " · erreur : " + j.erreur : "");
+  const list = $("scanList");
+  list.innerHTML = "";
+  (j.signaux || []).forEach(s => {
+    const d = document.createElement("div");
+    d.className = "log-item";
+    d.style.whiteSpace = "pre-line";
+    d.style.borderLeftColor = "#22c55e";
+    d.textContent = "🚨 " + s.heure + "\n" + s.texte;
+    list.appendChild(d);
+  });
+  Object.keys(j.symboles || {}).forEach(sym => {
+    const d = document.createElement("div");
+    d.className = "log-item";
+    d.textContent = sym + " — " + j.symboles[sym].resume;
+    list.appendChild(d);
+  });
+  $("scanSymbols").textContent = (j.disponibles || []).map(x => x[0] + " = " + x[1]).join("\n");
+}
+
 async function init() {
   fillMarkets(defaultMarkets, null);
   let me;
@@ -176,6 +239,8 @@ async function init() {
     return;
   }
   $("accountCard").style.display = "block";
+  loadScanner();
+  setInterval(loadScanner, 30000);
   await loadAccounts();
 }
 
@@ -325,6 +390,422 @@ window.onload = init;
 """
 
 
+# ==================================================================
+#  ANALYSE (CRT H4 + biais Daily/H4 + discount/premium + FVG M15)
+#  Les fonctions ci-dessous ne font aucun appel réseau.
+#  Chaque bougie = {"t": début en secondes, "o", "h", "l", "c"}
+#  Pour les VENTES, on inverse les prix (miroir) et on réutilise
+#  exactement la logique des ACHATS, puis on remet les prix à l'endroit.
+# ==================================================================
+RANK = {
+    "no_range": 0, "not_in_zone": 1, "no_crt": 2, "no_sweep": 3,
+    "no_reentry": 4, "no_fvg": 5, "waiting_retrace": 6, "rr_low": 7, "signal": 8,
+}
+ARROW = {"up": "↑", "down": "↓", None: "?"}
+
+
+def fmt(x):
+    return ("%.2f" % x) if abs(x) >= 100 else ("%.5f" % x)
+
+
+def split_closed(cs, gran, now):
+    closed = [c for c in cs if c["t"] + gran <= now]
+    forming = [c for c in cs if c["t"] + gran > now]
+    return closed, (forming[-1] if forming else None)
+
+
+def mirror(cs):
+    return [{"t": c["t"], "o": -c["o"], "h": -c["l"], "l": -c["h"], "c": -c["c"]} for c in cs]
+
+
+def mirror_one(c):
+    return None if c is None else mirror([c])[0]
+
+
+def swings(cs, n):
+    highs, lows = [], []
+    for i in range(n, len(cs) - n):
+        h, l = cs[i]["h"], cs[i]["l"]
+        if all(h > cs[i - k]["h"] for k in range(1, n + 1)) and all(h >= cs[i + k]["h"] for k in range(1, n + 1)):
+            highs.append((i, h))
+        if all(l < cs[i - k]["l"] for k in range(1, n + 1)) and all(l <= cs[i + k]["l"] for k in range(1, n + 1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def structure_bias(cs, n):
+    hs, ls = swings(cs, n)
+    if len(hs) < 2 or len(ls) < 2:
+        return None
+    if hs[-1][1] > hs[-2][1] and ls[-1][1] > ls[-2][1]:
+        return "up"
+    if hs[-1][1] < hs[-2][1] and ls[-1][1] < ls[-2][1]:
+        return "down"
+    return None
+
+
+def dealing_range_up(cs, n):
+    """Dernier grand mouvement haussier : du dernier creux au dernier sommet confirmés."""
+    hs, ls = swings(cs, n)
+    if not hs:
+        return None
+    hi_i, hi = hs[-1]
+    before = [v for i, v in ls if i < hi_i]
+    if not before:
+        return None
+    lo = before[-1]
+    if hi <= lo:
+        return None
+    return lo, hi
+
+
+def pick_tp(entry, h4c, c1_high):
+    hs, _ = swings(h4c[-150:], SWING_N)
+    levels = [h for _, h in hs if h > entry]
+    if c1_high > entry:
+        levels.append(c1_high)
+    if not levels:
+        return None, None
+    tp = min(levels)
+    near = [h for _, h in hs if abs(h - tp) <= abs(tp) * EQ_TOL]
+    if len(near) >= 2:
+        label = "Equal Highs"
+    elif tp == c1_high:
+        label = "haut du CRT"
+    else:
+        label = "sommet H4"
+    return tp, label
+
+
+def find_entry(c1, c2, m15c, allm, h4c):
+    win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
+    s = next((i for i, m in win if m["l"] < c1["l"]), None)
+    if s is None:
+        return {"code": "no_sweep"}
+    j = next((i for i in range(s, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
+    if j is None:
+        return {"code": "no_reentry"}
+    sweep_low = min(m["l"] for _, m in win)
+
+    cands = []
+    for i in range(s, len(m15c) - 2):
+        a, c = m15c[i], m15c[i + 2]
+        if i + 2 >= j and c["l"] > a["h"]:
+            bottom, top = a["h"], c["l"]
+            if all(m15c[k]["c"] >= bottom for k in range(i + 3, len(m15c))):
+                cands.append((i, bottom, top))
+    if not cands:
+        return {"code": "no_fvg"}
+    i, bottom, top = cands[-1]
+    price = allm[-1]["c"]
+    if price < bottom:
+        return {"code": "no_fvg"}
+
+    out = {
+        "fvg_bottom": bottom, "fvg_top": top, "fvg_t": m15c[i]["t"],
+        "sweep_low": sweep_low, "c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"],
+    }
+    touch = [k for k in range(i + 3, len(allm)) if allm[k]["l"] <= top]
+    if not touch or touch[-1] < len(allm) - 3:
+        out["code"] = "waiting_retrace"
+        return out
+
+    entry = top
+    if entry <= sweep_low:
+        out["code"] = "rr_low"
+        return out
+    tp, label = pick_tp(entry, h4c, c1["h"])
+    if tp is None:
+        out["code"] = "rr_low"
+        return out
+    rr = (tp - entry) / (entry - sweep_low)
+    out.update(entry=entry, sl=sweep_low, tp=tp, tp_label=label, rr=rr)
+    out["code"] = "signal" if rr >= MIN_RR else "rr_low"
+    return out
+
+
+def evaluate_buy(d1c, h4c, h4f, m15c, m15f):
+    allm = m15c + ([m15f] if m15f else [])
+    price = allm[-1]["c"]
+    rng = dealing_range_up(d1c, SWING_N)
+    if not rng:
+        return {"code": "no_range"}
+    lo, hi = rng
+    eq = (lo + hi) / 2.0
+    base = {"price": price, "range_lo": lo, "range_hi": hi, "eq": eq}
+    if not (lo <= price < eq):
+        return dict(base, code="not_in_zone")
+
+    pairs = []
+    if h4f is not None and h4c:
+        pairs.append((h4c[-1], h4f, False))   # la bougie 2 est en cours
+    if len(h4c) >= 2:
+        pairs.append((h4c[-2], h4c[-1], True))  # la bougie 2 vient de se fermer
+    best = dict(base, code="no_crt")
+    for c1, c2, closed in pairs:
+        if not (c2["l"] < c1["l"]) or c2["h"] > c1["h"]:
+            continue  # pas de sweep du bas, ou les deux côtés balayés
+        if closed and not (c1["l"] < c2["c"] <= c1["h"]):
+            continue  # la bougie 2 n'a pas clôturé dans le range
+        res = dict(base, **find_entry(c1, c2, m15c, allm, h4c))
+        if RANK[res["code"]] > RANK[best["code"]]:
+            best = res
+    return best
+
+
+def unmirror(m):
+    out = dict(m)
+    if "price" in m:
+        out["price"] = -m["price"]
+    if "eq" in m:
+        out["eq"] = -m["eq"]
+    if "range_lo" in m:
+        out["range_lo"], out["range_hi"] = -m["range_hi"], -m["range_lo"]
+    if "fvg_bottom" in m:
+        out["fvg_bottom"], out["fvg_top"] = -m["fvg_top"], -m["fvg_bottom"]
+    if "c1_high" in m:
+        out["c1_low"], out["c1_high"] = -m["c1_high"], -m["c1_low"]
+    for k in ("entry", "sl", "tp", "sweep_low"):
+        if k in m:
+            out[k] = -m[k]
+    labels = {"Equal Highs": "Equal Lows", "haut du CRT": "bas du CRT", "sommet H4": "creux H4"}
+    if "tp_label" in m:
+        out["tp_label"] = labels.get(m["tp_label"], m["tp_label"])
+    return out
+
+
+def analyze(sym, d1, h4, m15, now):
+    """Retourne (infos_pour_la_page, signal_ou_None)."""
+    d1c, _ = split_closed(d1, 86400, now)
+    h4c, h4f = split_closed(h4, 14400, now)
+    m15c, m15f = split_closed(m15, 900, now)
+    if len(d1c) < 15 or len(h4c) < 15 or len(m15c) < 15:
+        return {"resume": "pas assez de bougies reçues (D1 %d, H4 %d, M15 %d)" % (len(d1c), len(h4c), len(m15c))}, None
+
+    b_d1 = structure_bias(d1c, SWING_N)
+    b_h4 = structure_bias(h4c, SWING_N)
+    head = "D1 %s · H4 %s" % (ARROW[b_d1], ARROW[b_h4])
+    if b_d1 is None or b_d1 != b_h4:
+        return {"resume": head + " · pas de biais commun, pas de trade"}, None
+
+    buy = (b_d1 == "up")
+    zone = "discount" if buy else "premium"
+    if buy:
+        res = evaluate_buy(d1c, h4c, h4f, m15c, m15f)
+    else:
+        res = unmirror(evaluate_buy(mirror(d1c), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f)))
+
+    code = res["code"]
+    if RANK[code] >= RANK["no_crt"]:
+        head += " · en " + zone
+    msgs = {
+        "no_range": "range Daily introuvable",
+        "not_in_zone": "prix pas en %s (prix %s, équilibre %s)" % (zone, fmt(res.get("price", 0)), fmt(res.get("eq", 0))),
+        "no_crt": "pas de CRT H4 en cours",
+        "no_sweep": "CRT H4 vu, sweep pas encore visible en M15",
+        "no_reentry": "sweep fait, pas encore de clôture M15 dans le range",
+        "no_fvg": "retour dans le range, pas de FVG M15 valide",
+        "waiting_retrace": "FVG M15 repéré, attente du retour du prix dessus",
+        "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
+        "signal": "SETUP A+",
+    }
+    info = {"resume": head + " · " + msgs[code]}
+    if code == "signal":
+        sig = dict(res)
+        sig["side"] = "buy" if buy else "sell"
+        return info, sig
+    return info, None
+
+
+def build_text(sym, sig):
+    buy = sig["side"] == "buy"
+    return "\n".join([
+        "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", sym),
+        "Biais Daily + H4 %s, prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
+        "CRT H4 : sweep puis retour dans le range",
+        "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"])),
+        "Entrée repère : %s" % fmt(sig["entry"]),
+        "Stop : %s" % fmt(sig["sl"]),
+        "TP : %s (%s)" % (fmt(sig["tp"]), sig["tp_label"]),
+        "Gain/risque : %.1f pour 1" % sig["rr"],
+        "Aucun ordre n'est passé : vérifie sur le graphique avant d'entrer.",
+    ])
+
+
+# ==================================================================
+#  SCANNER (récupère les bougies et envoie les alertes)
+# ==================================================================
+class ApiError(Exception):
+    pass
+
+
+_REQ = 0
+
+
+async def ws_request(ws, payload, timeout=15):
+    global _REQ
+    _REQ += 1
+    rid = _REQ
+    await ws.send_str(json.dumps(dict(payload, req_id=rid)))
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("pas de réponse de Deriv")
+        msg = await ws.receive(timeout=remaining)
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data)
+            except ValueError:
+                continue
+            if data.get("req_id") == rid:
+                if data.get("error"):
+                    raise ApiError(str(data["error"].get("message", data["error"]))[:150])
+                return data
+        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                          aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            raise ConnectionError("WebSocket fermé par Deriv")
+
+
+def norm_candles(raw):
+    out = []
+    for c in raw or []:
+        try:
+            out.append({"t": int(c["epoch"]), "o": float(c["open"]), "h": float(c["high"]),
+                        "l": float(c["low"]), "c": float(c["close"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
+async def fetch_candles(ws, sym, gran, count):
+    data = await ws_request(ws, {
+        "ticks_history": sym, "end": "latest", "style": "candles",
+        "granularity": gran, "count": count,
+    })
+    return norm_candles(data.get("candles"))
+
+
+async def load_symbols(ws):
+    try:
+        data = await ws_request(ws, {"active_symbols": "brief"})
+    except (ApiError, asyncio.TimeoutError) as e:
+        print("active_symbols refusé :", repr(e))
+        return
+    items = []
+    for s in data.get("active_symbols") or []:
+        sid = s.get("underlying_symbol") or s.get("symbol")
+        if sid:
+            items.append([sid, s.get("underlying_symbol_name") or s.get("display_name") or sid])
+    items.sort(key=lambda x: x[1])
+    STATE["available"] = items
+    ids = set(x[0] for x in items)
+    for sym in SYMBOLS:
+        if items and sym not in ids:
+            print("ATTENTION : symbole inconnu chez Deriv :", sym)
+
+
+async def send_ntfy(title, text):
+    if not NTFY_TOPIC:
+        return
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.post(
+                "https://ntfy.sh/" + NTFY_TOPIC,
+                data=text.encode("utf-8"),
+                headers={"Title": title, "Priority": "high", "Tags": "chart_with_upwards_trend"},
+            ) as r:
+                if r.status >= 300:
+                    print("ntfy a répondu", r.status)
+    except Exception as e:
+        print("Erreur ntfy :", repr(e))
+
+
+async def handle_signal(sym, sig):
+    key = (sym, sig["side"], sig["c1_t"], sig["fvg_t"])
+    if key in SENT:
+        return
+    if len(SENT) > 500:
+        SENT.clear()
+    SENT.add(key)
+    text = build_text(sym, sig)
+    SIGNALS.append({"heure": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", "texte": text})
+    print("SIGNAL", sym, sig["side"])
+    await send_ntfy("Setup A+ %s %s" % (sym, "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
+
+
+async def scan_once(ws, cache):
+    for sym in SYMBOLS:
+        try:
+            ck = (sym, 86400)
+            if ck not in cache or time.time() - cache[ck][0] > 900:
+                cache[ck] = (time.time(), await fetch_candles(ws, sym, 86400, 150))
+            d1 = cache[ck][1]
+            h4 = await fetch_candles(ws, sym, 14400, 300)
+            m15 = await fetch_candles(ws, sym, 900, 300)
+            info, sig = analyze(sym, d1, h4, m15, time.time())
+        except ApiError as e:
+            info, sig = {"resume": "erreur Deriv : %s" % e}, None
+        STATE["symbols"][sym] = info
+        if sig:
+            await handle_signal(sym, sig)
+        await asyncio.sleep(0.3)
+    STATE["last"] = time.time()
+
+
+async def scanner_loop():
+    await asyncio.sleep(3)
+    if _raw_topic and not NTFY_TOPIC:
+        print("NTFY_TOPIC invalide : 8 à 64 caractères, lettres, chiffres, - ou _ seulement.")
+    print("Scanner : marchés =", SYMBOLS, "| ntfy actif :", bool(NTFY_TOPIC))
+    http = None
+    ws = None
+    cache = {}
+    first_ok = True
+    while True:
+        try:
+            if ws is None or ws.closed:
+                if http is None or http.closed:
+                    http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
+                ws = await http.ws_connect(PUBLIC_WS, heartbeat=25)
+                print("Scanner : connecté au flux public Deriv")
+                await load_symbols(ws)
+            await scan_once(ws, cache)
+            STATE["error"] = None
+            if first_ok:
+                first_ok = False
+                await send_ntfy("Scanner demarre", "Le scanner Adonis tourne sur le serveur. Les alertes arriveront ici.")
+        except asyncio.CancelledError:
+            if http is not None:
+                await http.close()
+            raise
+        except Exception as e:
+            STATE["error"] = (type(e).__name__ + ": " + str(e))[:200]
+            print("Scanner erreur :", repr(e))
+            try:
+                if ws is not None:
+                    await ws.close()
+            except Exception:
+                pass
+            ws = None
+        await asyncio.sleep(SCAN_EVERY)
+
+
+async def on_startup(app):
+    app["scanner"] = asyncio.create_task(scanner_loop())
+
+
+async def on_cleanup(app):
+    task = app.get("scanner")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 # ------------------------------------------------------------------
 # OUTILS
 # ------------------------------------------------------------------
@@ -461,6 +942,20 @@ async def api_me(request):
     return web.json_response({"logged_in": bool(s), "app_id_ok": bool(APP_ID)})
 
 
+async def api_scanner(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    return web.json_response({
+        "derniere_analyse": STATE["last"],
+        "erreur": STATE["error"],
+        "ntfy": bool(NTFY_TOPIC),
+        "symboles": STATE["symbols"],
+        "signaux": list(SIGNALS)[::-1],
+        "disponibles": STATE["available"][:300],
+    })
+
+
 def deriv_headers(token):
     return {"Authorization": "Bearer " + token, "Deriv-App-ID": APP_ID}
 
@@ -523,8 +1018,11 @@ app.router.add_get("/login", login)
 app.router.add_get("/callback", callback)
 app.router.add_get("/logout", logout)
 app.router.add_get("/api/me", api_me)
+app.router.add_get("/api/scanner", api_scanner)
 app.router.add_get("/api/accounts", api_accounts)
 app.router.add_post("/api/otp", api_otp)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
 
 if __name__ == "__main__":
     print("DERIV_APP_ID défini :", bool(APP_ID))
