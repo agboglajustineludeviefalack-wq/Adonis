@@ -7,6 +7,7 @@ import base64
 import asyncio
 import hashlib
 import secrets
+from bisect import bisect_right
 from collections import deque
 from urllib.parse import urlencode
 
@@ -42,7 +43,11 @@ NTFY_TOPIC = _raw_topic if re.match(r"^[A-Za-z0-9_-]{8,64}$", _raw_topic) else "
 SYMBOLS = [
     s.strip()
     for s in os.environ.get(
-        "SCAN_SYMBOLS", "frxXAUUSD,R_50,stpRNG,BOOM500,CRASH500"
+        "SCAN_SYMBOLS",
+        "1HZ50V,R_50,stpRNG,BOOM500,CRASH500,"
+        "frxXAUUSD,frxXAGUSD,"
+        "frxEURUSD,frxGBPUSD,frxUSDJPY,frxAUDUSD,frxUSDCAD,frxUSDCHF,frxNZDUSD,frxEURGBP,frxEURJPY,frxGBPJPY,"
+        "cryBTCUSD,cryETHUSD"
     ).split(",")
     if s.strip()
 ]
@@ -50,6 +55,8 @@ SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté 
 MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
 EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))   # tolérance des Equal Highs/Lows (0.05 %)
 SCAN_EVERY = int(os.environ.get("SCAN_EVERY", "60"))  # secondes entre deux analyses
+H4_TTL = 240                                          # secondes avant de retélécharger le H4
+BT_DAYS = int(os.environ.get("BT_DAYS", "90"))        # durée du test historique (jours)
 
 # Mémoire du serveur (se vide si Railway redémarre : il faudra se reconnecter)
 SESSIONS = {}  # sid -> {"token": ..., "exp": ...}
@@ -58,6 +65,7 @@ PENDING = {}   # state -> {"verifier": ..., "ts": ...}
 STATE = {"last": None, "error": None, "symbols": {}, "available": []}
 SIGNALS = deque(maxlen=30)
 SENT = set()
+BT = {"running": False, "done": False, "progress": "", "error": None, "results": None}
 
 
 HTML_CONTENT = r"""
@@ -104,6 +112,14 @@ HTML_CONTENT = r"""
       <summary class="small">Marchés disponibles chez Deriv</summary>
       <pre id="scanSymbols"></pre>
     </details>
+  </div>
+
+  <div class="card" id="btCard" style="display:none;">
+    <h3>🧪 Test historique</h3>
+    <p class="small">Rejoue tes règles sur le passé, marché par marché, sans spread ni commission. Résultats en « R » : 1 R = ce que tu risques sur un trade (perdu = -1 R, gagné = +gain/risque).</p>
+    <button class="btn btn-blue" id="btBtn" onclick="startBacktest()">Lancer le test</button>
+    <div id="btStatus" class="small" style="margin-top:8px;"></div>
+    <div id="btList" style="margin-top:8px;"></div>
   </div>
 
   <div class="card" id="accountCard" style="display:none;">
@@ -224,6 +240,44 @@ async function loadScanner() {
   $("scanSymbols").textContent = (j.disponibles || []).map(x => x[0] + " = " + x[1]).join("\n");
 }
 
+let btTimer = null;
+
+async function startBacktest() {
+  $("btBtn").disabled = true;
+  $("btStatus").textContent = "Démarrage...";
+  try { await fetch("/api/backtest/start", { method: "POST" }); } catch (e) { $("btStatus").textContent = "Erreur : " + e; return; }
+  if (btTimer) clearInterval(btTimer);
+  btTimer = setInterval(loadBacktest, 3000);
+  loadBacktest();
+}
+
+async function loadBacktest() {
+  let r;
+  try { r = await fetch("/api/backtest"); } catch (e) { return; }
+  if (r.status === 401) return;
+  const j = await r.json();
+  $("btStatus").textContent = j.error ? "Erreur : " + j.error : (j.running ? "En cours : " + j.progress : (j.done ? "Terminé." : ""));
+  if (!j.running) {
+    $("btBtn").disabled = false;
+    if (btTimer) { clearInterval(btTimer); btTimer = null; }
+  }
+  const list = $("btList");
+  list.innerHTML = "";
+  if (!j.results) return;
+  const t = j.results.total;
+  const head = document.createElement("div");
+  head.className = "log-item";
+  head.style.borderLeftColor = "#22c55e";
+  head.textContent = "TOTAL (" + j.results.jours + " jours) : " + t.setups + " setups · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + t.expires + " sans issue · " + (t.r_total >= 0 ? "+" : "") + t.r_total + " R" + (t.setups < 30 ? " — échantillon trop petit pour conclure" : "");
+  list.appendChild(head);
+  j.results.lignes.forEach(l => {
+    const d = document.createElement("div");
+    d.className = "log-item";
+    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + l.expires + " sans issue · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R");
+    list.appendChild(d);
+  });
+}
+
 async function init() {
   fillMarkets(defaultMarkets, null);
   let me;
@@ -239,6 +293,8 @@ async function init() {
     return;
   }
   $("accountCard").style.display = "block";
+  $("btCard").style.display = "block";
+  loadBacktest();
   loadScanner();
   setInterval(loadScanner, 30000);
   await loadAccounts();
@@ -575,15 +631,24 @@ def unmirror(m):
 
 
 def analyze(sym, d1, h4, m15, now):
-    """Retourne (infos_pour_la_page, signal_ou_None)."""
+    """Version en direct : sépare les bougies fermées / en cours, puis analyse."""
+    if m15 and now - (m15[-1]["t"] + 900) > 1800:
+        return {"resume": "marché fermé ou données anciennes"}, None
     d1c, _ = split_closed(d1, 86400, now)
     h4c, h4f = split_closed(h4, 14400, now)
     m15c, m15f = split_closed(m15, 900, now)
+    return analyze_core(d1c, h4c, h4f, m15c, m15f)
+
+
+def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
+    """Retourne (infos_pour_la_page, signal_ou_None)."""
     if len(d1c) < 15 or len(h4c) < 15 or len(m15c) < 15:
         return {"resume": "pas assez de bougies reçues (D1 %d, H4 %d, M15 %d)" % (len(d1c), len(h4c), len(m15c))}, None
 
-    b_d1 = structure_bias(d1c, SWING_N)
-    b_h4 = structure_bias(h4c, SWING_N)
+    if biases:
+        b_d1, b_h4 = biases
+    else:
+        b_d1, b_h4 = structure_bias(d1c, SWING_N), structure_bias(h4c, SWING_N)
     head = "D1 %s · H4 %s" % (ARROW[b_d1], ARROW[b_h4])
     if b_d1 is None or b_d1 != b_h4:
         return {"resume": head + " · pas de biais commun, pas de trade"}, None
@@ -625,7 +690,7 @@ def build_text(sym, sig):
         "CRT H4 : sweep puis retour dans le range",
         "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"])),
         "Entrée repère : %s" % fmt(sig["entry"]),
-        "Stop : %s" % fmt(sig["sl"]),
+        "Stop : %s (distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
         "TP : %s (%s)" % (fmt(sig["tp"]), sig["tp_label"]),
         "Gain/risque : %.1f pour 1" % sig["rr"],
         "Aucun ordre n'est passé : vérifie sur le graphique avant d'entrer.",
@@ -735,17 +800,25 @@ async def handle_signal(sym, sig):
     await send_ntfy("Setup A+ %s %s" % (sym, "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
 
 
+def stale(fetched, now, ttl, gran):
+    return now - fetched > ttl or int(now // gran) != int(fetched // gran)
+
+
 async def scan_once(ws, cache):
     for sym in SYMBOLS:
         try:
-            ck = (sym, 86400)
-            if ck not in cache or time.time() - cache[ck][0] > 900:
-                cache[ck] = (time.time(), await fetch_candles(ws, sym, 86400, 150))
-            d1 = cache[ck][1]
-            h4 = await fetch_candles(ws, sym, 14400, 300)
+            now = time.time()
+            ck, hk = (sym, 86400), (sym, 14400)
+            if ck not in cache or stale(cache[ck][0], now, 900, 86400):
+                cache[ck] = (now, await fetch_candles(ws, sym, 86400, 150))
+            if hk not in cache or stale(cache[hk][0], now, H4_TTL, 14400):
+                cache[hk] = (now, await fetch_candles(ws, sym, 14400, 300))
             m15 = await fetch_candles(ws, sym, 900, 300)
-            info, sig = analyze(sym, d1, h4, m15, time.time())
+            info, sig = analyze(sym, cache[ck][1], cache[hk][1], m15, time.time())
         except ApiError as e:
+            if "rate" in str(e).lower():
+                STATE["error"] = "limite de requêtes Deriv atteinte, nouvel essai au prochain tour"
+                return
             info, sig = {"resume": "erreur Deriv : %s" % e}, None
         STATE["symbols"][sym] = info
         if sig:
@@ -790,6 +863,159 @@ async def scanner_loop():
                 pass
             ws = None
         await asyncio.sleep(SCAN_EVERY)
+
+
+# ==================================================================
+#  TEST HISTORIQUE : rejoue les règles sur le passé, bougie M15 par bougie M15
+#  Règles anti-triche : à chaque instant, l'analyse ne voit que ce qui existait.
+#  La bougie H4 « en cours » est reconstruite avec les M15 déjà fermées.
+# ==================================================================
+def partial_candle(m15, i, T, period):
+    p = (T // period) * period
+    k = i
+    while k >= 0 and m15[k]["t"] >= p:
+        k -= 1
+    seg = m15[k + 1:i + 1]
+    if not seg:
+        return None
+    return {"t": p, "o": seg[0]["o"], "h": max(x["h"] for x in seg),
+            "l": min(x["l"] for x in seg), "c": seg[-1]["c"]}
+
+
+def simulate(sig, m15, i, max_bars=288):
+    """Suit le trade après le signal. Si stop et TP sont touchés dans la même bougie : stop (pessimiste)."""
+    buy = sig["side"] == "buy"
+    entry, sl, tp = sig["entry"], sig["sl"], sig["tp"]
+    risk = abs(entry - sl)
+    last_j = min(len(m15) - 1, i + max_bars)
+    for j in range(i + 1, last_j + 1):
+        c = m15[j]
+        hit_sl = (c["l"] <= sl) if buy else (c["h"] >= sl)
+        hit_tp = (c["h"] >= tp) if buy else (c["l"] <= tp)
+        if hit_sl:
+            return "loss", -1.0, j
+        if hit_tp:
+            return "win", sig["rr"], j
+    close = m15[last_j]["c"]
+    r = ((close - entry) if buy else (entry - close)) / risk
+    return ("timeout" if i + max_bars < len(m15) else "open"), r, last_j
+
+
+async def replay(d1, h4, m15, start_i):
+    d1_t = [c["t"] for c in d1]
+    h4_t = [c["t"] for c in h4]
+    cache = {}
+    seen = set()
+    trades = []
+    busy = -1
+    for i in range(start_i, len(m15)):
+        if i % 200 == 0:
+            await asyncio.sleep(0)  # laisse respirer le serveur
+        T = m15[i]["t"] + 900
+        kd = bisect_right(d1_t, T - 86400)
+        kh = bisect_right(h4_t, T - 14400)
+        if kd < 15 or kh < 15:
+            continue
+        key = (kd, kh)
+        if key not in cache:
+            cache[key] = (structure_bias(d1[max(0, kd - 150):kd], SWING_N),
+                          structure_bias(h4[max(0, kh - 300):kh], SWING_N))
+        b_d1, b_h4 = cache[key]
+        if b_d1 is None or b_d1 != b_h4 or i <= busy:
+            continue
+        d1c = d1[max(0, kd - 150):kd]
+        h4c = h4[max(0, kh - 300):kh]
+        m15c = m15[max(0, i + 1 - 300):i + 1]
+        h4f = partial_candle(m15, i, T, 14400)
+        _, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4))
+        if not sig:
+            continue
+        k = (sig["side"], sig["c1_t"], sig["fvg_t"])
+        if k in seen:
+            continue
+        seen.add(k)
+        res, r, j = simulate(sig, m15, i)
+        trades.append({"side": sig["side"], "t": T, "res": res, "r": r, "rr": sig["rr"]})
+        busy = j
+    return trades
+
+
+def summarize(sym, trades):
+    w = sum(1 for t in trades if t["res"] == "win")
+    l = sum(1 for t in trades if t["res"] == "loss")
+    to = sum(1 for t in trades if t["res"] == "timeout")
+    op = sum(1 for t in trades if t["res"] == "open")
+    total_r = sum(t["r"] for t in trades if t["res"] != "open")
+    return {"symbole": sym, "setups": len(trades), "gagnes": w, "perdus": l,
+            "expires": to, "ouverts": op, "r_total": round(total_r, 2)}
+
+
+async def fetch_history(ws, sym, gran, target, page):
+    got = {}
+    end = "latest"
+    for _ in range(8):
+        data = await ws_request(ws, {"ticks_history": sym, "end": end, "style": "candles",
+                                     "granularity": gran, "count": page}, timeout=40)
+        cs = norm_candles(data.get("candles"))
+        fresh = [c for c in cs if c["t"] not in got]
+        for c in cs:
+            got[c["t"]] = c
+        if not cs or len(got) >= target or len(fresh) <= 1:
+            break
+        end = str(cs[0]["t"])
+        await asyncio.sleep(0.3)
+    return sorted(got.values(), key=lambda c: c["t"])
+
+
+async def run_backtest():
+    BT.update(running=True, done=False, error=None, results=None, progress="connexion à Deriv...")
+    http = None
+    ws = None
+    try:
+        http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
+        ws = await http.ws_connect(PUBLIC_WS, heartbeat=25)
+        rows = []
+        for n, sym in enumerate(SYMBOLS):
+            tag = "%d/%d %s" % (n + 1, len(SYMBOLS), sym)
+            BT["progress"] = tag + " : téléchargement des bougies..."
+            try:
+                d1 = await fetch_history(ws, sym, 86400, 400, 400)
+                h4 = await fetch_history(ws, sym, 14400, 1500, 1500)
+                m15 = await fetch_history(ws, sym, 900, (BT_DAYS + 4) * 96, 4000)
+            except ApiError as e:
+                rows.append({"symbole": sym, "erreur": str(e)})
+                continue
+            if len(m15) < 400:
+                rows.append({"symbole": sym, "erreur": "pas assez d'historique (%d bougies M15)" % len(m15)})
+                continue
+            BT["progress"] = tag + " : analyse..."
+            start_t = m15[-1]["t"] - BT_DAYS * 86400
+            start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
+            trades = await replay(d1, h4, m15, start_i)
+            rows.append(summarize(sym, trades))
+        ok = [r for r in rows if "erreur" not in r]
+        total = {
+            "setups": sum(r["setups"] for r in ok), "gagnes": sum(r["gagnes"] for r in ok),
+            "perdus": sum(r["perdus"] for r in ok), "expires": sum(r["expires"] for r in ok),
+            "ouverts": sum(r["ouverts"] for r in ok), "r_total": round(sum(r["r_total"] for r in ok), 2),
+        }
+        BT["results"] = {"jours": BT_DAYS, "lignes": rows, "total": total}
+        BT["done"] = True
+        BT["progress"] = "terminé"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        BT["error"] = (type(e).__name__ + ": " + str(e))[:200]
+        print("Test historique erreur :", repr(e))
+    finally:
+        BT["running"] = False
+        try:
+            if ws is not None:
+                await ws.close()
+            if http is not None:
+                await http.close()
+        except Exception:
+            pass
 
 
 async def on_startup(app):
@@ -956,6 +1182,22 @@ async def api_scanner(request):
     })
 
 
+async def api_bt_start(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    if not BT["running"]:
+        request.app["bt_task"] = asyncio.create_task(run_backtest())
+    return web.json_response({"running": True})
+
+
+async def api_bt_status(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    return web.json_response(BT)
+
+
 def deriv_headers(token):
     return {"Authorization": "Bearer " + token, "Deriv-App-ID": APP_ID}
 
@@ -1019,6 +1261,8 @@ app.router.add_get("/callback", callback)
 app.router.add_get("/logout", logout)
 app.router.add_get("/api/me", api_me)
 app.router.add_get("/api/scanner", api_scanner)
+app.router.add_post("/api/backtest/start", api_bt_start)
+app.router.add_get("/api/backtest", api_bt_status)
 app.router.add_get("/api/accounts", api_accounts)
 app.router.add_post("/api/otp", api_otp)
 app.on_startup.append(on_startup)
