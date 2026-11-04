@@ -56,7 +56,7 @@ MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
 EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))   # tolérance des Equal Highs/Lows (0.05 %)
 SCAN_EVERY = int(os.environ.get("SCAN_EVERY", "60"))  # secondes entre deux analyses
 H4_TTL = 240                                          # secondes avant de retélécharger le H4
-BT_DAYS = int(os.environ.get("BT_DAYS", "90"))        # durée du test historique (jours)
+BT_DAYS = int(os.environ.get("BT_DAYS", "180"))        # durée du test historique (jours)
 
 # Mémoire du serveur (se vide si Railway redémarre : il faudra se reconnecter)
 SESSIONS = {}  # sid -> {"token": ..., "exp": ...}
@@ -270,10 +270,15 @@ async function loadBacktest() {
   head.style.borderLeftColor = "#22c55e";
   head.textContent = "TOTAL (" + j.results.jours + " jours) : " + t.setups + " setups · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + t.expires + " sans issue · " + (t.r_total >= 0 ? "+" : "") + t.r_total + " R" + (t.setups < 30 ? " — échantillon trop petit pour conclure" : "");
   list.appendChild(head);
+  const pct = (a, b) => b ? Math.round(a * 100 / b) : 0;
+  const fun = document.createElement("div");
+  fun.className = "log-item";
+  fun.textContent = "Entonnoir (" + t.marches + " marchés) : biais Daily+H4 d'accord " + pct(t.bias, t.steps) + " % du temps · prix du bon côté de l'équilibre " + pct(t.zone, t.steps) + " % · CRT H4 avec sweep : " + t.crt + " · FVG M15 formés : " + t.fvg + " · rejetés par gain/risque : " + t.rr_rejetes + " · signaux : " + t.setups;
+  list.appendChild(fun);
   j.results.lignes.forEach(l => {
     const d = document.createElement("div");
     d.className = "log-item";
-    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + l.expires + " sans issue · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R");
+    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R · biais " + pct(l.bias, l.steps) + " % · CRT " + l.crt + " · FVG " + l.fvg + " · rejetés RR " + l.rr_rejetes);
     list.appendChild(d);
   });
 }
@@ -537,10 +542,10 @@ def find_entry(c1, c2, m15c, allm, h4c):
     win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
     s = next((i for i, m in win if m["l"] < c1["l"]), None)
     if s is None:
-        return {"code": "no_sweep"}
+        return {"code": "no_sweep", "c1_t": c1["t"]}
     j = next((i for i in range(s, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
     if j is None:
-        return {"code": "no_reentry"}
+        return {"code": "no_reentry", "c1_t": c1["t"]}
     sweep_low = min(m["l"] for _, m in win)
 
     cands = []
@@ -551,11 +556,11 @@ def find_entry(c1, c2, m15c, allm, h4c):
             if all(m15c[k]["c"] >= bottom for k in range(i + 3, len(m15c))):
                 cands.append((i, bottom, top))
     if not cands:
-        return {"code": "no_fvg"}
+        return {"code": "no_fvg", "c1_t": c1["t"]}
     i, bottom, top = cands[-1]
     price = allm[-1]["c"]
     if price < bottom:
-        return {"code": "no_fvg"}
+        return {"code": "no_fvg", "c1_t": c1["t"]}
 
     out = {
         "fvg_bottom": bottom, "fvg_top": top, "fvg_t": m15c[i]["t"],
@@ -674,7 +679,8 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
         "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
         "signal": "SETUP A+",
     }
-    info = {"resume": head + " · " + msgs[code]}
+    info = {"resume": head + " · " + msgs[code], "code": code,
+            "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t")}
     if code == "signal":
         sig = dict(res)
         sig["side"] = "buy" if buy else "sell"
@@ -908,6 +914,7 @@ async def replay(d1, h4, m15, start_i):
     seen = set()
     trades = []
     busy = -1
+    st = {"steps": 0, "bias": 0, "zone": 0, "crt": set(), "fvg": set(), "rr": set()}
     for i in range(start_i, len(m15)):
         if i % 200 == 0:
             await asyncio.sleep(0)  # laisse respirer le serveur
@@ -921,13 +928,26 @@ async def replay(d1, h4, m15, start_i):
             cache[key] = (structure_bias(d1[max(0, kd - 150):kd], SWING_N),
                           structure_bias(h4[max(0, kh - 300):kh], SWING_N))
         b_d1, b_h4 = cache[key]
-        if b_d1 is None or b_d1 != b_h4 or i <= busy:
+        st["steps"] += 1
+        if b_d1 is None or b_d1 != b_h4:
+            continue
+        st["bias"] += 1
+        if i <= busy:
             continue
         d1c = d1[max(0, kd - 150):kd]
         h4c = h4[max(0, kh - 300):kh]
         m15c = m15[max(0, i + 1 - 300):i + 1]
         h4f = partial_candle(m15, i, T, 14400)
-        _, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4))
+        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4))
+        rk = RANK.get(info.get("code"), -1)
+        if rk >= RANK["no_crt"]:
+            st["zone"] += 1
+        if rk >= RANK["no_sweep"] and info.get("c1_t"):
+            st["crt"].add(info["c1_t"])
+        if rk >= RANK["waiting_retrace"] and info.get("c1_t") and info.get("fvg_t"):
+            st["fvg"].add((info["c1_t"], info["fvg_t"]))
+        if info.get("code") == "rr_low" and info.get("c1_t") and info.get("fvg_t"):
+            st["rr"].add((info["c1_t"], info["fvg_t"]))
         if not sig:
             continue
         k = (sig["side"], sig["c1_t"], sig["fvg_t"])
@@ -937,25 +957,39 @@ async def replay(d1, h4, m15, start_i):
         res, r, j = simulate(sig, m15, i)
         trades.append({"side": sig["side"], "t": T, "res": res, "r": r, "rr": sig["rr"]})
         busy = j
-    return trades
+    return trades, st
 
 
-def summarize(sym, trades):
+def summarize(sym, trades, st):
     w = sum(1 for t in trades if t["res"] == "win")
     l = sum(1 for t in trades if t["res"] == "loss")
     to = sum(1 for t in trades if t["res"] == "timeout")
     op = sum(1 for t in trades if t["res"] == "open")
     total_r = sum(t["r"] for t in trades if t["res"] != "open")
     return {"symbole": sym, "setups": len(trades), "gagnes": w, "perdus": l,
-            "expires": to, "ouverts": op, "r_total": round(total_r, 2)}
+            "expires": to, "ouverts": op, "r_total": round(total_r, 2),
+            "steps": st["steps"], "bias": st["bias"], "zone": st["zone"],
+            "crt": len(st["crt"]), "fvg": len(st["fvg"]), "rr_rejetes": len(st["rr"])}
+
+
+async def hist_request(ws, payload):
+    for attempt in range(5):
+        try:
+            return await ws_request(ws, payload, timeout=40)
+        except ApiError as e:
+            if "rate" in str(e).lower() and attempt < 4:
+                BT["progress"] = "limite de Deriv atteinte, pause de 45 s..."
+                await asyncio.sleep(45)
+                continue
+            raise
 
 
 async def fetch_history(ws, sym, gran, target, page):
     got = {}
     end = "latest"
     for _ in range(8):
-        data = await ws_request(ws, {"ticks_history": sym, "end": end, "style": "candles",
-                                     "granularity": gran, "count": page}, timeout=40)
+        data = await hist_request(ws, {"ticks_history": sym, "end": end, "style": "candles",
+                                       "granularity": gran, "count": page})
         cs = norm_candles(data.get("candles"))
         fresh = [c for c in cs if c["t"] not in got]
         for c in cs:
@@ -963,7 +997,8 @@ async def fetch_history(ws, sym, gran, target, page):
         if not cs or len(got) >= target or len(fresh) <= 1:
             break
         end = str(cs[0]["t"])
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(2.5)
+    await asyncio.sleep(2.5)
     return sorted(got.values(), key=lambda c: c["t"])
 
 
@@ -991,13 +1026,17 @@ async def run_backtest():
             BT["progress"] = tag + " : analyse..."
             start_t = m15[-1]["t"] - BT_DAYS * 86400
             start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
-            trades = await replay(d1, h4, m15, start_i)
-            rows.append(summarize(sym, trades))
+            trades, st = await replay(d1, h4, m15, start_i)
+            rows.append(summarize(sym, trades, st))
         ok = [r for r in rows if "erreur" not in r]
         total = {
             "setups": sum(r["setups"] for r in ok), "gagnes": sum(r["gagnes"] for r in ok),
             "perdus": sum(r["perdus"] for r in ok), "expires": sum(r["expires"] for r in ok),
             "ouverts": sum(r["ouverts"] for r in ok), "r_total": round(sum(r["r_total"] for r in ok), 2),
+            "steps": sum(r["steps"] for r in ok), "bias": sum(r["bias"] for r in ok),
+            "zone": sum(r["zone"] for r in ok), "crt": sum(r["crt"] for r in ok),
+            "fvg": sum(r["fvg"] for r in ok), "rr_rejetes": sum(r["rr_rejetes"] for r in ok),
+            "marches": len(ok),
         }
         BT["results"] = {"jours": BT_DAYS, "lignes": rows, "total": total}
         BT["done"] = True
