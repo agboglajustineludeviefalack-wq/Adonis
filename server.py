@@ -18,7 +18,7 @@ HTML_CONTENT = """
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis</h1>
-        <span id="connectionBadge" style="background: #ef4444; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Déconnecté</span>
+        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connexion...</span>
     </div>
 
     <!-- Sélection du Broker et Token -->
@@ -70,46 +70,50 @@ HTML_CONTENT = """
     function initWebSocket(token, broker) {
         if (broker === 'deriv') {
             document.getElementById('activeBrokerName').innerText = "Deriv";
+            document.getElementById('connectionBadge').style.background = '#eab308';
+            document.getElementById('connectionBadge').innerText = "Connexion...";
             
-            // Connexion au WebSocket officiel Deriv
-            ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+            try {
+                ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
 
-            ws.onopen = function() {
-                console.log("WebSocket ouvert, envoi de l'autorisation...");
-                ws.send(JSON.stringify({ authorize: token }));
-            };
+                ws.onopen = function() {
+                    console.log("WebSocket ouvert, envoi de l'autorisation...");
+                    ws.send(JSON.stringify({ authorize: token }));
+                };
 
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                
-                if (data.msg_type === 'authorize') {
-                    if (data.error) {
-                        alert("Erreur d'authentification : " + data.error.message);
-                        document.getElementById('connectionBadge').style.background = '#ef4444';
-                        document.getElementById('connectionBadge').innerText = "Déconnecté";
-                        document.getElementById('radarCard').style.display = 'none';
-                    } else {
-                        // Succès de l'authentification ! On affiche le badge vert et le radar
-                        document.getElementById('connectionBadge').style.background = '#22c55e';
-                        document.getElementById('connectionBadge').innerText = "Connecté (Live)";
-                        document.getElementById('radarCard').style.display = 'block';
-                        
-                        // Demande des ticks pour l'actif
-                        ws.send(JSON.stringify({ ticks: 'R_50' }));
+                ws.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.msg_type === 'authorize') {
+                        if (data.error) {
+                            alert("Erreur d'authentification : " + data.error.message);
+                            document.getElementById('connectionBadge').style.background = '#ef4444';
+                            document.getElementById('connectionBadge').innerText = "Erreur Token";
+                            document.getElementById('radarCard').style.display = 'none';
+                        } else {
+                            document.getElementById('connectionBadge').style.background = '#22c55e';
+                            document.getElementById('connectionBadge').innerText = "Connecté (Live)";
+                            document.getElementById('radarCard').style.display = 'block';
+                            ws.send(JSON.stringify({ ticks: 'R_50' }));
+                        }
                     }
-                }
 
-                if (data.msg_type === 'tick') {
-                    const tick = data.tick;
-                    document.getElementById('priceV50').innerText = tick.quote.toFixed(2);
-                }
-            };
+                    if (data.msg_type === 'tick') {
+                        const tick = data.tick;
+                        document.getElementById('priceV50').innerText = tick.quote.toFixed(2);
+                    }
+                };
 
-            ws.onerror = function(error) {
-                console.error("Erreur WebSocket:", error);
+                ws.onerror = function(error) {
+                    console.error("Erreur WebSocket:", error);
+                    document.getElementById('connectionBadge').style.background = '#ef4444';
+                    document.getElementById('connectionBadge').innerText = "Erreur Réseau";
+                };
+            } catch (e) {
+                console.error(e);
                 document.getElementById('connectionBadge').style.background = '#ef4444';
                 document.getElementById('connectionBadge').innerText = "Erreur Réseau";
-            };
+            }
         } else {
             alert("Broker non pris en charge pour l'instant.");
         }
@@ -120,7 +124,6 @@ HTML_CONTENT = """
         alert("Ordre d'achat transmis avec succès à " + broker.toUpperCase() + " !");
     }
 
-    // Connexion automatique au chargement si un token est déjà enregistré
     window.onload = function() {
         const savedToken = localStorage.getItem('user_api_token');
         const savedBroker = localStorage.getItem('selected_broker');
