@@ -24,7 +24,7 @@ HTML_CONTENT = """
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
         <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Autonome</h1>
-        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Pro)</span>
+        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Déconnecté</span>
     </div>
 
     <!-- Tableau de Bord du Compte (Démo/Réel & Solde) -->
@@ -106,7 +106,7 @@ HTML_CONTENT = """
         const token = document.getElementById('apitoken').value;
         if (!token.trim()) { alert("Entre un token valide !"); return; }
         localStorage.setItem('user_api_token', token);
-        document.getElementById('connectionBadge.style.background = '#22c55e';
+        document.getElementById('connectionBadge').style.background = '#22c55e';
         document.getElementById('connectionBadge').innerText = "Connecté (Pro)";
         alert("Robot connecté avec succès !");
     }
@@ -181,7 +181,6 @@ HTML_CONTENT = """
         document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l\\'évolution.</div>';
     }
 
-    // Animation en temps réel du P&L et du solde sans coupure réseau
     setInterval(() => {
         if (!activeTrade) return;
 
@@ -206,10 +205,13 @@ HTML_CONTENT = """
 
     window.onload = function() {
         const savedToken = localStorage.getItem('user_api_token');
-        if (savedToken) {
+        if (savedToken && savedToken.trim() !== "") {
             document.getElementById('apitoken').value = savedToken;
             document.getElementById('connectionBadge').style.background = '#22c55e';
             document.getElementById('connectionBadge').innerText = "Connecté (Pro)";
+        } else {
+            document.getElementById('connectionBadge').style.background = '#eab308';
+            document.getElementById('connectionBadge').innerText = "Déconnecté";
         }
     };
     </script>
