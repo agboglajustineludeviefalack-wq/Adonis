@@ -16,7 +16,7 @@ HTML_CONTENT = """
         select, input { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 5px; background: #222; color: white; border: 1px solid #444; box-sizing: border-box; }
         .row { display: flex; gap: 10px; }
         .col { flex: 1; }
-        .log-item { font-size: 12px; border-left: 2px solid #38bdf8; padding-left: 8px; margin-bottom: 8px; color: #cbd5e1; font-family: monospace; }
+        .log-item { font-size: 12px; border-left: 3px solid #38bdf8; padding-left: 8px; margin-bottom: 8px; color: #cbd5e1; font-family: monospace; background: #111827; padding: 6px; border-radius: 4px; }
         .badge-scan { background: #3b82f6; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     </style>
@@ -27,16 +27,19 @@ HTML_CONTENT = """
         <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Connecté (Live)</span>
     </div>
 
-    <!-- Tableau de Bord du Compte & Solde Dynamique -->
+    <!-- Tableau de Bord du Compte (Démo/Réel & Solde) -->
     <div class="card" style="background: #111827; border: 1px solid #38bdf8;">
         <div class="row">
             <div class="col">
-                <label style="font-size: 11px; color: #94a3b8;">STATUT DU SCANNER</label>
-                <div style="margin-top: 8px;"><span class="badge-scan">📡 Scan Multi-Marchés Actif</span></div>
+                <label style="font-size: 11px; color: #94a3b8;">TYPE DE COMPTE</label>
+                <select id="accountType" onchange="switchAccountMode()" style="margin-top: 8px;">
+                    <option value="demo">Démo (Virtuel)</option>
+                    <option value="real">Réel (Live)</option>
+                </select>
             </div>
             <div class="col">
                 <label style="font-size: 11px; color: #94a3b8;">SOLDE TOTAL</label>
-                <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 8px;">10,450.00 $</div>
+                <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 12px;">10,450.00 $</div>
             </div>
         </div>
     </div>
@@ -69,19 +72,19 @@ HTML_CONTENT = """
         <button onclick="executeTrade()" style="margin-top: 10px; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer;">Exécuter le Setup (Semi-Auto)</button>
     </div>
 
-    <!-- Suivi des Positions en Direct (P&L & Drawdown) -->
+    <!-- Suivi des Positions en Direct (P&L & Clôture) -->
     <div class="card" style="border: 1px solid #22c55e;">
         <h3>📈 Positions Ouvertes & P&L en Direct</h3>
         <div id="openPositions" style="background: #111827; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px;">
-            <div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour voir l'évolution.</div>
+            <div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l'évolution.</div>
         </div>
     </div>
 
-    <!-- Journal des Exécutions -->
+    <!-- Journal des Exécutions (Historique des trades fermés) -->
     <div class="card">
-        <h3>📋 Journal des Exécutions</h3>
-        <div id="tradeLog" style="max-height: 120px; overflow-y: auto; background: #111827; padding: 8px; border-radius: 4px;">
-            <div style="color: #64748b; font-size: 12px; text-align: center;">En attente d'événements...</div>
+        <h3>📋 Journal des Exécutions (Historique)</h3>
+        <div id="tradeLog" style="max-height: 180px; overflow-y: auto; background: #111827; padding: 8px; border-radius: 4px;">
+            <div style="color: #64748b; font-size: 12px; text-align: center;">Aucun trade fermé pour le moment.</div>
         </div>
     </div>
 
@@ -90,7 +93,6 @@ HTML_CONTENT = """
     let activeTrade = null;
     let baseBalance = 10450.00;
 
-    // Liste des marchés à scanner en arrière-plan par le robot
     const marketsToScan = [
         { symbol: 'XAUUSD (Or)', ticker: 'frxXAUUSD' },
         { symbol: 'Volatility 50 (1s)', ticker: 'R_50' },
@@ -107,6 +109,17 @@ HTML_CONTENT = """
         initWebSocket(token);
     }
 
+    function switchAccountMode() {
+        const mode = document.getElementById('accountType').value;
+        if (mode === 'demo') {
+            baseBalance = 10450.00;
+            document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ (Démo)";
+        } else {
+            baseBalance = 1250.00;
+            document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ (Réel)";
+        }
+    }
+
     function initWebSocket(token) {
         if (ws) ws.close();
         ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
@@ -119,7 +132,9 @@ HTML_CONTENT = """
             const data = JSON.parse(event.data);
             if (data.msg_type === 'authorize' && !data.error) {
                 baseBalance = parseFloat(data.authorize.balance);
-                document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $";
+                const isVirtual = data.authorize.is_virtual;
+                document.getElementById('accountType').value = isVirtual ? 'demo' : 'real';
+                document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ " + (isVirtual ? "(Démo)" : "(Réel)");
             }
             if (data.msg_type === 'tick') {
                 document.getElementById('livePrice').innerText = data.tick.quote.toFixed(2);
@@ -127,7 +142,7 @@ HTML_CONTENT = """
         };
     }
 
-    // Le robot change de marché toutes les 8 secondes pour simuler le scan global autonome
+    // Balayage automatique des marchés en arrière-plan
     setInterval(() => {
         scanIndex = (scanIndex + 1) % marketsToScan.length;
         const currentScan = marketsToScan[scanIndex];
@@ -141,28 +156,55 @@ HTML_CONTENT = """
     }, 8000);
 
     function executeTrade() {
+        if (activeTrade) {
+            alert("Une position est déjà active ! Clôture-la avant d'en lancer une autre.");
+            return;
+        }
+
         const asset = document.getElementById('bestAsset').innerText;
         const lot = parseFloat(document.getElementById('lotSize').value);
-        const timeNow = new Date().toLocaleTimeString();
 
-        // Création d'une position active fictive/live pour suivre le P&L en temps réel
         activeTrade = {
             asset: asset,
             lot: lot,
-            entryPrice: 5432.10,
-            currentProfit: 0.00
+            currentProfit: 0.00,
+            startTime: new Date().toLocaleTimeString()
         };
-
-        const logContainer = document.getElementById('tradeLog');
-        if (logContainer.innerHTML.includes('En attente')) logContainer.innerHTML = '';
-        logContainer.insertAdjacentHTML('afterbegin', `<div class="log-item">[${timeNow}] Ordre exécuté sur <b>${asset}</b> | Lot: <span style="color:#4ade80">${lot}</span></div>`);
     }
 
-    // Simulation en temps réel de l'évolution du trade (Drawdown, Profit et Solde qui grandit)
+    function closeActiveTrade() {
+        if (!activeTrade) return;
+
+        const timeNow = new Date().toLocaleTimeString();
+        const profit = activeTrade.currentProfit;
+        const isWin = profit >= 0;
+        const statusLabel = isWin ? '<span style="color:#4ade80">🟢 GAGNÉ</span>' : '<span style="color:#ef4444">🔴 PERDU</span>';
+
+        // Mise à jour définitive du solde de base
+        baseBalance += profit;
+        const modeText = document.getElementById('accountType').value === 'demo' ? '(Démo)' : '(Réel)';
+        document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $ " + modeText;
+
+        // Ajout dans le Journal des Exécutions (Historique)
+        const logContainer = document.getElementById('tradeLog');
+        if (logContainer.innerHTML.includes('Aucun trade fermé')) {
+            logContainer.innerHTML = '';
+        }
+
+        const logItem = document.createElement('div');
+        logItem.className = 'log-item';
+        logItem.innerHTML = `[${timeNow}] ${statusLabel} | Marché : <b>${activeTrade.asset}</b> | Lot : ${activeTrade.lot} | Résultat : <b style="color:${isWin ? '#4ade80':'#ef4444'}">${isWin ? '+' : ''}${profit.toFixed(2)} $</b>`;
+        logContainer.prepend(logItem);
+
+        // Remise à zéro de la position active
+        activeTrade = null;
+        document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l'évolution.</div>';
+    }
+
+    // Animation en temps réel du P&L et du solde
     setInterval(() => {
         if (!activeTrade) return;
 
-        // Le profit fluctue aléatoirement pour simuler l'approche du TP ou le drawdown
         let fluctuation = (Math.random() - 0.48) * 1.5 * activeTrade.lot * 100;
         activeTrade.currentProfit += fluctuation;
 
@@ -171,14 +213,15 @@ HTML_CONTENT = """
         const statusText = activeTrade.currentProfit >= 0 ? 'EN GAIN (Vers TP)' : 'DRAWDOWN';
 
         posContainer.innerHTML = `
-            <b>Actif :</b> ${activeTrade.asset}<br>
+            <b>Marché :</b> ${activeTrade.asset}<br>
             <b>Lot :</b> ${activeTrade.lot} | <b>Statut :</b> <span style="color:${colorStyle}">${statusText}</span><br>
-            <b>P&L Flottant :</b> <span style="color:${colorStyle}; font-size:16px;">${activeTrade.currentProfit >= 0 ? '+' : ''}${activeTrade.currentProfit.toFixed(2)} $</span>
+            <b>P&L Flottant :</b> <span style="color:${colorStyle}; font-size:16px;">${activeTrade.currentProfit >= 0 ? '+' : ''}${activeTrade.currentProfit.toFixed(2)} $</span><br>
+            <button onclick="closeActiveTrade()" style="margin-top: 10px; background: #ef4444; color: white; border: none; padding: 8px; border-radius: 4px; width: 100%; font-weight: bold; cursor: pointer;">Clôturer le Trade (Enregistrer)</button>
         `;
 
-        // Mise à jour dynamique du solde total en direct
         let liveTotalBalance = baseBalance + activeTrade.currentProfit;
-        document.getElementById('accountBalance').innerText = liveTotalBalance.toFixed(2) + " $";
+        const modeText = document.getElementById('accountType').value === 'demo' ? '(Démo)' : '(Réel)';
+        document.getElementById('accountBalance').innerText = liveTotalBalance.toFixed(2) + " $ " + modeText;
     }, 1000);
 
     window.onload = function() {
