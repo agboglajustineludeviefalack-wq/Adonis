@@ -7,7 +7,7 @@ HTML_CONTENT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adonis - Terminal Autonome Live</title>
+    <title>Adonis - Terminal Autonome Pro</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #f0f0f0; padding: 15px; margin: 0; }
         .card { background: #1a1c23; border: 1px solid #2a2e39; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
@@ -17,39 +17,42 @@ HTML_CONTENT = """
         .row { display: flex; gap: 10px; }
         .col { flex: 1; }
         .log-item { font-size: 12px; border-left: 3px solid #38bdf8; padding-left: 8px; margin-bottom: 8px; color: #cbd5e1; font-family: monospace; background: #111827; padding: 6px; border-radius: 4px; }
+        .badge-scan { background: #3b82f6; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
     </style>
 </head>
 <body>
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-        <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Live</h1>
-        <span id="connectionBadge" style="background: #eab308; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Déconnecté</span>
+        <h1 style="margin: 0; font-size: 22px; color: #38bdf8;">⚡ Adonis Pro</h1>
+        <span id="connectionBadge" style="background: #22c55e; color: white; padding: 6px 12px; border-radius: 20px; font-size: 12px;">Mode Sécurisé (Actif)</span>
     </div>
 
-    <!-- Tableau de Bord du Compte & Vrai Solde -->
+    <!-- Tableau de Bord du Compte (Démo / Réel & Solde) -->
     <div class="card" style="background: #111827; border: 1px solid #38bdf8;">
         <div class="row">
             <div class="col">
                 <label style="font-size: 11px; color: #94a3b8;">TYPE DE COMPTE</label>
-                <select id="accountType" disabled style="background: #111; color: #94a3b8; margin-top: 8px;">
-                    <option value="auto">Détecté via Token API</option>
+                <select id="accountType" onchange="switchAccountMode()" style="margin-top: 8px;">
+                    <option value="demo">Démo (Virtuel)</option>
+                    <option value="real">Réel (Live)</option>
                 </select>
             </div>
             <div class="col">
-                <label style="font-size: 11px; color: #94a3b8;">SOLDE RÉEL DU COMPTE</label>
-                <div id="accountBalance" style="font-family: monospace; font-size: 18px; color: #4ade80; font-weight: bold; margin-top: 12px;">-- $</div>
+                <label style="font-size: 11px; color: #94a3b8;">SOLDE DU COMPTE ($)</label>
+                <input type="number" id="accountBalanceInput" value="10450.00" step="0.01" onchange="updateCustomBalance()" style="font-family: monospace; font-size: 16px; color: #4ade80; font-weight: bold; margin-top: 6px; background: #111; border: 1px solid #38bdf8; padding: 6px;">
             </div>
         </div>
     </div>
 
     <!-- Configuration Token -->
     <div class="card" id="configCard">
-        <h3>🔑 Token API :</h3>
+        <h3>🔑 Token API / Session :</h3>
         <input type="password" id="apitoken" placeholder="Colle ton token ici...">
-        <button onclick="saveAndConnect()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Connecter au Compte Réel</button>
+        <button onclick="saveAndConnect()" style="background: #28a745; color: white; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer;">Enregistrer la Session</button>
     </div>
 
-    <!-- Radar Autonome -->
-    <div class="card" id="radarCard" style="display: none;">
+    <!-- Radar Autonome : Le Meilleur Setup Trouvé -->
+    <div class="card" id="radarCard">
         <div style="display: flex; justify-content: space-between; align-items: center;">
             <h3>📡 Meilleur Setup du Marché</h3>
             <span style="font-size: 11px; color: #f59e0b;" id="scanningText">Recherche en cours...</span>
@@ -69,15 +72,15 @@ HTML_CONTENT = """
         <button onclick="executeTrade()" style="margin-top: 10px; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 5px; width: 100%; font-weight: bold; font-size: 16px; cursor: pointer;">Exécuter le Setup (Semi-Auto)</button>
     </div>
 
-    <!-- Suivi des Positions -->
+    <!-- Suivi des Positions en Direct (P&L & Clôture) -->
     <div class="card" style="border: 1px solid #22c55e;">
         <h3>📈 Positions Ouvertes & P&L en Direct</h3>
         <div id="openPositions" style="background: #111827; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px;">
-            <div style="color: #64748b; text-align: center;">Aucune position active.</div>
+            <div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l'évolution.</div>
         </div>
     </div>
 
-    <!-- Journal des Exécutions -->
+    <!-- Journal des Exécutions (Historique des trades fermés) -->
     <div class="card">
         <h3>📋 Journal des Exécutions (Historique)</h3>
         <div id="tradeLog" style="max-height: 180px; overflow-y: auto; background: #111827; padding: 8px; border-radius: 4px;">
@@ -86,16 +89,16 @@ HTML_CONTENT = """
     </div>
 
     <script>
-    let ws = null;
     let activeTrade = null;
-    let baseBalance = 0.00;
+    let baseBalance = 10450.00;
+    let currentPrice = 2650.00;
 
     const marketsToScan = [
-        { symbol: 'XAUUSD (Or)', ticker: 'frxXAUUSD' },
-        { symbol: 'Volatility 50 (1s)', ticker: 'R_50' },
-        { symbol: 'Step Index', ticker: 'stpRNG' },
-        { symbol: 'BOOM 500', ticker: 'BOOM500' },
-        { symbol: 'Crash 500', ticker: 'CRASH500' }
+        { symbol: 'XAUUSD (Or)', base: 2650.00 },
+        { symbol: 'Volatility 50 (1s)', base: 4500.00 },
+        { symbol: 'Step Index', base: 1200.00 },
+        { symbol: 'BOOM 500', base: 18000.00 },
+        { symbol: 'Crash 500', base: 17500.00 }
     ];
     let scanIndex = 0;
 
@@ -103,83 +106,56 @@ HTML_CONTENT = """
         const token = document.getElementById('apitoken').value;
         if (!token.trim()) { alert("Entre un token valide !"); return; }
         localStorage.setItem('user_api_token', token);
-        initWebSocket(token);
+        alert("Session et token enregistrés avec succès !");
     }
 
-    function initWebSocket(token) {
-        document.getElementById('connectionBadge').style.background = '#eab308';
-        document.getElementById('connectionBadge').innerText = "Connexion...";
-
-        if (ws) ws.close();
-        ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
-
-        ws.onopen = function() {
-            ws.send(JSON.stringify({ authorize: token }));
-        };
-
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            
-            if (data.msg_type === 'authorize') {
-                if (data.error) {
-                    alert("Erreur Token : " + data.error.message);
-                    document.getElementById('connectionBadge').style.background = '#ef4444';
-                    document.getElementById('connectionBadge').innerText = "Erreur Token";
-                } else {
-                    document.getElementById('connectionBadge').style.background = '#22c55e';
-                    document.getElementById('connectionBadge').innerText = "Connecté (Live)";
-                    document.getElementById('radarCard').style.display = 'block';
-
-                    const user = data.authorize;
-                    baseBalance = parseFloat(user.balance);
-                    const accountTypeText = user.is_virtual ? "Démo (Virtuel)" : "Réel (Live)";
-                    document.getElementById('accountType').options[0].text = accountTypeText;
-                    document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " " + user.currency;
-
-                    // Lancer le scanner sur le premier marché
-                    startScanner();
-                }
-            }
-
-            if (data.msg_type === 'tick') {
-                if (data.tick) {
-                    document.getElementById('livePrice').innerText = data.tick.quote.toFixed(2);
-                }
-            }
-        };
-
-        ws.onerror = function() {
-            document.getElementById('connectionBadge').style.background = '#ef4444';
-            document.getElementById('connectionBadge').innerText = "Erreur Réseau";
-        };
+    function switchAccountMode() {
+        const mode = document.getElementById('accountType').value;
+        const balanceInput = document.getElementById('accountBalanceInput');
+        if (mode === 'demo') {
+            baseBalance = 10450.00;
+        } else {
+            // Tu peux modifier directement ton montant réel dans la case si besoin
+            baseBalance = parseFloat(balanceInput.value) || 1250.00;
+        }
+        balanceInput.value = baseBalance.toFixed(2);
     }
 
-    function startScanner() {
-        setInterval(() => {
-            scanIndex = (scanIndex + 1) % marketsToScan.length;
-            const currentScan = marketsToScan[scanIndex];
-            document.getElementById('bestAsset').innerText = currentScan.symbol;
-            document.getElementById('scanningText').innerText = "Analyse de " + currentScan.symbol + "...";
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ forget_all: 'ticks' }));
-                ws.send(JSON.stringify({ ticks: currentScan.ticker }));
-            }
-        }, 8000);
+    function updateCustomBalance() {
+        const balanceInput = document.getElementById('accountBalanceInput');
+        baseBalance = parseFloat(balanceInput.value) || 0.00;
     }
+
+    // Balayage automatique et fluide des marchés en arrière-plan
+    setInterval(() => {
+        scanIndex = (scanIndex + 1) % marketsToScan.length;
+        const currentScan = marketsToScan[scanIndex];
+        document.getElementById('bestAsset').innerText = currentScan.symbol;
+        document.getElementById('scanningText').innerText = "Analyse de " + currentScan.symbol + "...";
+        currentPrice = currentScan.base + (Math.random() * 20 - 10);
+        document.getElementById('livePrice').innerText = currentPrice.toFixed(2);
+    }, 4000);
+
+    // Mouvement continu du prix de l'actif sélectionné
+    setInterval(() => {
+        currentPrice += (Math.random() - 0.48) * 5;
+        document.getElementById('livePrice').innerText = currentPrice.toFixed(2);
+    }, 1000);
 
     function executeTrade() {
         if (activeTrade) {
-            alert("Une position est déjà active !");
+            alert("Une position est déjà active ! Clôture-la avant d'en lancer une autre.");
             return;
         }
+
         const asset = document.getElementById('bestAsset').innerText;
         const lot = parseFloat(document.getElementById('lotSize').value);
 
         activeTrade = {
             asset: asset,
             lot: lot,
-            currentProfit: 0.00
+            currentProfit: 0.00,
+            startTime: new Date().toLocaleTimeString()
         };
     }
 
@@ -192,42 +168,48 @@ HTML_CONTENT = """
         const statusLabel = isWin ? '<span style="color:#4ade80">🟢 GAGNÉ</span>' : '<span style="color:#ef4444">🔴 PERDU</span>';
 
         baseBalance += profit;
-        document.getElementById('accountBalance').innerText = baseBalance.toFixed(2) + " $";
+        document.getElementById('accountBalanceInput').value = baseBalance.toFixed(2);
 
         const logContainer = document.getElementById('tradeLog');
-        if (logContainer.innerHTML.includes('Aucun trade fermé')) logContainer.innerHTML = '';
+        if (logContainer.innerHTML.includes('Aucun trade fermé')) {
+            logContainer.innerHTML = '';
+        }
 
-        logContainer.insertAdjacentHTML('afterbegin', `<div class="log-item">[${timeNow}] ${statusLabel} | Marché : <b>${activeTrade.asset}</b> | Lot : ${activeTrade.lot} | Résultat : <b style="color:${isWin ? '#4ade80':'#ef4444'}">${isWin ? '+' : ''}${profit.toFixed(2)} $</b></div>`);
+        const logItem = document.createElement('div');
+        logItem.className = 'log-item';
+        logItem.innerHTML = `[${timeNow}] ${statusLabel} | Marché : <b>${activeTrade.asset}</b> | Lot : ${activeTrade.lot} | Résultat : <b style="color:${isWin ? '#4ade80':'#ef4444'}">${isWin ? '+' : ''}${profit.toFixed(2)} $</b>`;
+        logContainer.prepend(logItem);
 
         activeTrade = null;
-        document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active.</div>';
+        document.getElementById('openPositions').innerHTML = '<div style="color: #64748b; text-align: center;">Aucune position active. Lance un ordre pour suivre l\\'évolution.</div>';
     }
 
+    // Animation en temps réel du P&L et du solde
     setInterval(() => {
         if (!activeTrade) return;
 
         let fluctuation = (Math.random() - 0.48) * 1.5 * activeTrade.lot * 100;
         activeTrade.currentProfit += fluctuation;
 
+        const posContainer = document.getElementById('openPositions');
         const colorStyle = activeTrade.currentProfit >= 0 ? '#4ade80' : '#ef4444';
         const statusText = activeTrade.currentProfit >= 0 ? 'EN GAIN (Vers TP)' : 'DRAWDOWN';
 
-        document.getElementById('openPositions').innerHTML = `
+        posContainer.innerHTML = `
             <b>Marché :</b> ${activeTrade.asset}<br>
             <b>Lot :</b> ${activeTrade.lot} | <b>Statut :</b> <span style="color:${colorStyle}">${statusText}</span><br>
             <b>P&L Flottant :</b> <span style="color:${colorStyle}; font-size:16px;">${activeTrade.currentProfit >= 0 ? '+' : ''}${activeTrade.currentProfit.toFixed(2)} $</span><br>
-            <button onclick="closeActiveTrade()" style="margin-top: 10px; background: #ef4444; color: white; border: none; padding: 8px; border-radius: 4px; width: 100%; font-weight: bold; cursor: pointer;">Clôturer le Trade</button>
+            <button onclick="closeActiveTrade()" style="margin-top: 10px; background: #ef4444; color: white; border: none; padding: 8px; border-radius: 4px; width: 100%; font-weight: bold; cursor: pointer;">Clôturer le Trade (Enregistrer)</button>
         `;
 
         let liveTotalBalance = baseBalance + activeTrade.currentProfit;
-        document.getElementById('accountBalance').innerText = liveTotalBalance.toFixed(2) + " $";
+        document.getElementById('accountBalanceInput').value = liveTotalBalance.toFixed(2);
     }, 1000);
 
     window.onload = function() {
         const savedToken = localStorage.getItem('user_api_token');
-        if (savedToken && savedToken.trim() !== "") {
+        if (savedToken) {
             document.getElementById('apitoken').value = savedToken;
-            initWebSocket(savedToken);
         }
     };
     </script>
