@@ -54,6 +54,8 @@ MT5 = {
     "CRASH1000": "Crash 1000", "BOOM1000": "Boom 1000", "JD10": "Jump 10", "stpRNG": "Step Index",
     "frxBROUSD": "US Oil",
 }
+# Boom : spikes vers le haut -> achats seulement. Crash : spikes vers le bas -> ventes seulement.
+SIDE_ONLY = {"BOOM500": "buy", "BOOM1000": "buy", "CRASH500": "sell", "CRASH1000": "sell"}
 RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
 NAMES = {}      # code Deriv -> nom affiché par Deriv
 PD_RANGE = os.environ.get("PD_RANGE", "H4").upper()    # range du discount/premium : H4 ou D1
@@ -226,7 +228,7 @@ async function loadScanner() {
   const j = await r.json();
   $("scanCard").style.display = "block";
   const when = j.derniere_analyse ? new Date(j.derniere_analyse * 1000).toLocaleTimeString() : "pas encore";
-  $("scanMeta").textContent = "Dernière analyse : " + when + " · alertes ntfy : " + (j.ntfy ? "actives" : "NON configurées") + (j.erreur ? " · erreur : " + j.erreur : "");
+  $("scanMeta").textContent = "Dernière analyse : " + when + " · alertes ntfy : " + (j.ntfy_etat || (j.ntfy ? "actives" : "non configurées")) + (j.erreur ? " · erreur : " + j.erreur : "");
   const list = $("scanList");
   list.innerHTML = "";
   (j.signaux || []).forEach(s => {
@@ -285,7 +287,7 @@ async function loadBacktest() {
   j.results.lignes.forEach(l => {
     const d = document.createElement("div");
     d.className = "log-item";
-    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R · biais " + pct(l.bias, l.steps) + " % · CRT " + l.crt + " · FVG " + l.fvg + " · rejetés RR " + l.rr_rejetes);
+    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R (achats " + l.achats + " : " + (l.r_achats >= 0 ? "+" : "") + l.r_achats + " R, ventes " + l.ventes + " : " + (l.r_ventes >= 0 ? "+" : "") + l.r_ventes + " R) · biais " + pct(l.bias, l.steps) + " % · CRT " + l.crt + " · FVG " + l.fvg + " · rejetés RR " + l.rr_rejetes);
     list.appendChild(d);
   });
 }
@@ -666,10 +668,10 @@ def analyze(sym, d1, h4, m15, now):
     d1c, _ = split_closed(d1, 86400, now)
     h4c, h4f = split_closed(h4, 14400, now)
     m15c, m15f = split_closed(m15, 900, now)
-    return analyze_core(d1c, h4c, h4f, m15c, m15f)
+    return analyze_core(d1c, h4c, h4f, m15c, m15f, None, SIDE_ONLY.get(sym))
 
 
-def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
+def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None):
     """Retourne (infos_pour_la_page, signal_ou_None)."""
     if len(d1c) < 15 or len(h4c) < 15 or len(m15c) < 15:
         return {"resume": "pas assez de bougies reçues (D1 %d, H4 %d, M15 %d)" % (len(d1c), len(h4c), len(m15c))}, None
@@ -684,6 +686,10 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
     if side is None:
         why = "H4 sans structure claire" if b_h4 is None else "Daily contre le H4"
         return {"resume": head + " · " + why + ", pas de trade" + px}, None
+
+    if only and ((only == "buy") != (side == "up")):
+        return {"resume": head + " · ici on ne trade que les %s (spikes), mais le H4 est %s : pas de trade%s" % (
+            "achats" if only == "buy" else "ventes", "haussier" if side == "up" else "baissier", px)}, None
 
     buy = (side == "up")
     zone = "discount" if buy else "premium"
@@ -946,7 +952,7 @@ def simulate(sig, m15, i, max_bars=288):
     return ("timeout" if i + max_bars < len(m15) else "open"), r, last_j
 
 
-async def replay(d1, h4, m15, start_i):
+async def replay(d1, h4, m15, start_i, only=None):
     d1_t = [c["t"] for c in d1]
     h4_t = [c["t"] for c in h4]
     cache = {}
@@ -968,7 +974,8 @@ async def replay(d1, h4, m15, start_i):
                           structure_bias(h4[max(0, kh - 300):kh], SWING_N))
         b_d1, b_h4 = cache[key]
         st["steps"] += 1
-        if pick_side(b_d1, b_h4) is None:
+        side = pick_side(b_d1, b_h4)
+        if side is None or (only and ((only == "buy") != (side == "up"))):
             continue
         st["bias"] += 1
         if i <= busy:
@@ -977,7 +984,7 @@ async def replay(d1, h4, m15, start_i):
         h4c = h4[max(0, kh - 300):kh]
         m15c = m15[max(0, i + 1 - 300):i + 1]
         h4f = partial_candle(m15, i, T, 14400)
-        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4))
+        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4), only)
         rk = RANK.get(info.get("code"), -1)
         if rk >= RANK["no_crt"]:
             st["zone"] += 1
@@ -1005,7 +1012,10 @@ def summarize(sym, trades, st):
     to = sum(1 for t in trades if t["res"] == "timeout")
     op = sum(1 for t in trades if t["res"] == "open")
     total_r = sum(t["r"] for t in trades if t["res"] != "open")
-    return {"symbole": label(sym), "setups": len(trades), "gagnes": w, "perdus": l,
+    buys = [t for t in trades if t["side"] == "buy" and t["res"] != "open"]
+    sells = [t for t in trades if t["side"] == "sell" and t["res"] != "open"]
+    return {"symbole": label(sym), "achats": len(buys), "r_achats": round(sum(t["r"] for t in buys), 2),
+            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades), "gagnes": w, "perdus": l,
             "expires": to, "ouverts": op, "r_total": round(total_r, 2),
             "steps": st["steps"], "bias": st["bias"], "zone": st["zone"],
             "crt": len(st["crt"]), "fvg": len(st["fvg"]), "rr_rejetes": len(st["rr"])}
@@ -1065,7 +1075,7 @@ async def run_backtest():
             BT["progress"] = tag + " : analyse..."
             start_t = m15[-1]["t"] - BT_DAYS * 86400
             start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
-            trades, st = await replay(d1, h4, m15, start_i)
+            trades, st = await replay(d1, h4, m15, start_i, SIDE_ONLY.get(sym))
             rows.append(summarize(sym, trades, st))
         ok = [r for r in rows if "erreur" not in r]
         total = {
@@ -1246,6 +1256,14 @@ async def api_me(request):
     return web.json_response({"logged_in": bool(s), "app_id_ok": bool(APP_ID)})
 
 
+def ntfy_etat():
+    if NTFY_TOPIC:
+        return "actives"
+    if _raw_topic:
+        return "NOM INVALIDE (lettres, chiffres, - et _ seulement, 8 à 64 caractères)"
+    return "variable NTFY_TOPIC introuvable sur le serveur"
+
+
 async def api_scanner(request):
     _, s = get_session(request)
     if not s:
@@ -1254,6 +1272,7 @@ async def api_scanner(request):
         "derniere_analyse": STATE["last"],
         "erreur": STATE["error"],
         "ntfy": bool(NTFY_TOPIC),
+        "ntfy_etat": ntfy_etat(),
         "symboles": STATE["symbols"],
         "signaux": list(SIGNALS)[::-1],
         "disponibles": STATE["available"][:300],
