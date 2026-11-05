@@ -1070,7 +1070,9 @@ async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
         rk = RANK.get(info.get("code"), -1)
         if rk >= RANK["no_crt"]:
             st["zone"] += 1
-        if rk >= RANK["no_sweep"] and info.get("c1_t"):
+        # Compter un CRT avec sweep uniquement après la détection effective
+        # du sweep M15. Le code "no_sweep" signifie précisément qu'il manque.
+        if rk > RANK["no_sweep"] and info.get("c1_t"):
             st["crt"].add(info["c1_t"])
         k2 = (info.get("c1_t"), info.get("fvg_t"))
         if rk >= RANK["waiting_retrace"] and k2[0] and k2[1]:
