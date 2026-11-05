@@ -302,6 +302,13 @@ async function loadBacktest() {
     const sm = document.createElement("summary");
     sm.textContent = MODE_NAMES[c.mode] + " · RR ≥ " + c.min_rr + " : " + t.setups + " trades · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + sign(t.r_total) + " R (" + sign(per) + " R/trade) · avant les " + res.jours_new + " derniers jours : " + t.n_old + " trades, " + sign(t.r_old) + " R · " + res.jours_new + " derniers jours : " + t.n_new + " trades, " + sign(t.r_new) + " R";
     det.appendChild(sm);
+    const audit = document.createElement("div");
+    audit.style.marginTop = "6px";
+    audit.style.padding = "8px";
+    audit.style.background = "rgba(255,255,255,.04)";
+    const p = t.periods || [];
+    audit.textContent = "Robustesse : sans le meilleur trade " + sign(t.sans_best1_r) + " R ; sans les 2 meilleurs " + sign(t.sans_best2_r) + " R. Périodes chronologiques : " + p.map((x, i) => "P" + (i + 1) + " " + x.n + " trades / " + sign(x.r) + " R").join(" · ");
+    det.appendChild(audit);
     c.lignes.forEach(l => {
       const d = document.createElement("div");
       d.style.marginTop = "4px";
@@ -313,7 +320,7 @@ async function loadBacktest() {
   const note = document.createElement("div");
   note.className = "small";
   note.style.marginTop = "6px";
-  note.textContent = "Rappel : coûts réels (spread, glissement, commission) non inclus. Moins de 100 trades par variante = échantillon insuffisant.";
+  note.textContent = "Audit de robustesse ajouté : retrait du meilleur trade et des 2 meilleurs, plus découpage chronologique en 3 périodes. Les coûts réels (spread, glissement, commission) restent exclus faute de données de coûts par marché ; moins de 100 trades par variante = échantillon encore limité.";
   list.appendChild(note);
 }
 
@@ -1110,17 +1117,45 @@ def summarize(sym, trades):
 
 
 def combo_total(trades, split_t):
+    # Les trades encore ouverts ne sont pas inclus dans les performances réalisées.
     closed = [t for t in trades if t["res"] != "open"]
     old = [t for t in closed if t["t"] < split_t]
     new = [t for t in closed if t["t"] >= split_t]
+    ordered = sorted(closed, key=lambda t: t["r"], reverse=True)
+    total_r = sum(t["r"] for t in closed)
+
+    # Concentration : résultat après retrait du ou des meilleurs trades.
+    best1 = ordered[0]["r"] if ordered else 0.0
+    best2 = sum(t["r"] for t in ordered[:2])
+
+    # Trois périodes chronologiques de même durée sur l'intervalle observé.
+    # Les bornes sont calculées sur les trades effectivement clôturés.
+    periods = []
+    if closed:
+        t_min = min(t["t"] for t in closed)
+        t_max = max(t["t"] for t in closed)
+        span = max(1, t_max - t_min + 1)
+        for idx in range(3):
+            lo = t_min + span * idx / 3
+            hi = t_min + span * (idx + 1) / 3
+            group = [t for t in closed if lo <= t["t"] < hi or (idx == 2 and t["t"] == t_max)]
+            periods.append({"n": len(group), "r": round(sum(t["r"] for t in group), 2)})
+    else:
+        periods = [{"n": 0, "r": 0.0} for _ in range(3)]
+
     return {"setups": len(trades),
             "gagnes": sum(1 for t in trades if t["res"] == "win"),
             "perdus": sum(1 for t in trades if t["res"] == "loss"),
             "expires": sum(1 for t in trades if t["res"] == "timeout"),
             "ouverts": sum(1 for t in trades if t["res"] == "open"),
-            "r_total": round(sum(t["r"] for t in closed), 2),
+            "r_total": round(total_r, 2),
             "n_old": len(old), "r_old": round(sum(t["r"] for t in old), 2),
-            "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2)}
+            "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2),
+            "best1_r": round(best1, 2),
+            "sans_best1_r": round(total_r - best1, 2),
+            "best2_r": round(best2, 2),
+            "sans_best2_r": round(total_r - best2, 2),
+            "periods": periods}
 
 
 async def hist_request(ws, payload):
