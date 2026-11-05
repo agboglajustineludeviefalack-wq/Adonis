@@ -40,17 +40,23 @@ ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # --- Scanner ---
 _raw_topic = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_TOPIC = _raw_topic if re.match(r"^[A-Za-z0-9_-]{8,64}$", _raw_topic) else ""
-SYMBOLS = [
-    s.strip()
-    for s in os.environ.get(
-        "SCAN_SYMBOLS",
-        "1HZ50V,R_50,stpRNG,BOOM500,CRASH500,"
-        "frxXAUUSD,frxXAGUSD,"
-        "frxEURUSD,frxGBPUSD,frxUSDJPY,frxAUDUSD,frxUSDCAD,frxUSDCHF,frxNZDUSD,frxEURGBP,frxEURJPY,frxGBPJPY,"
-        "cryBTCUSD,cryETHUSD"
-    ).split(",")
-    if s.strip()
-]
+_DEFAULT_SYMBOLS = (
+    "frxXAUUSD,cryBTCUSD,frxEURUSD,frxUSDJPY,frxAUDCAD,"
+    "1HZ50V,BOOM500,CRASH500,CRASH1000,BOOM1000,JD10,stpRNG,frxBROUSD|oil"
+)
+_cfg = [x.strip() for x in os.environ.get("SCAN_SYMBOLS", _DEFAULT_SYMBOLS).split(",") if x.strip()]
+SYMBOLS = [x.split("|")[0].strip() for x in _cfg]
+HINTS = {x.split("|")[0].strip(): x.split("|")[1].strip() for x in _cfg if "|" in x}
+# Noms tels qu'ils apparaissent dans ton MT5 (pour les alertes et la page)
+MT5 = {
+    "frxXAUUSD": "XAUUSD", "cryBTCUSD": "BTCUSD", "frxEURUSD": "EURUSD", "frxUSDJPY": "USDJPY",
+    "frxAUDCAD": "AUDCAD", "1HZ50V": "Volatility 50 (1s)", "BOOM500": "Boom 500", "CRASH500": "Crash 500",
+    "CRASH1000": "Crash 1000", "BOOM1000": "Boom 1000", "JD10": "Jump 10", "stpRNG": "Step Index",
+    "frxBROUSD": "US Oil",
+}
+RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
+NAMES = {}      # code Deriv -> nom affiché par Deriv
+PD_RANGE = os.environ.get("PD_RANGE", "H4").upper()    # range du discount/premium : H4 ou D1
 SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté d'un sommet/creux
 MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
 EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))   # tolérance des Equal Highs/Lows (0.05 %)
@@ -234,7 +240,8 @@ async function loadScanner() {
   Object.keys(j.symboles || {}).forEach(sym => {
     const d = document.createElement("div");
     d.className = "log-item";
-    d.textContent = sym + " — " + j.symboles[sym].resume;
+    const si = j.symboles[sym];
+    d.textContent = (si.label || sym) + " — " + si.resume;
     list.appendChild(d);
   });
   $("scanSymbols").textContent = (j.disponibles || []).map(x => x[0] + " = " + x[1]).join("\n");
@@ -273,7 +280,7 @@ async function loadBacktest() {
   const pct = (a, b) => b ? Math.round(a * 100 / b) : 0;
   const fun = document.createElement("div");
   fun.className = "log-item";
-  fun.textContent = "Entonnoir (" + t.marches + " marchés) : biais Daily+H4 d'accord " + pct(t.bias, t.steps) + " % du temps · prix du bon côté de l'équilibre " + pct(t.zone, t.steps) + " % · CRT H4 avec sweep : " + t.crt + " · FVG M15 formés : " + t.fvg + " · rejetés par gain/risque : " + t.rr_rejetes + " · signaux : " + t.setups;
+  fun.textContent = "Entonnoir (" + t.marches + " marchés) : biais H4 exploitable (Daily pas contre) " + pct(t.bias, t.steps) + " % du temps · prix du bon côté de l'équilibre " + pct(t.zone, t.steps) + " % · CRT H4 avec sweep : " + t.crt + " · FVG M15 formés : " + t.fvg + " · rejetés par gain/risque : " + t.rr_rejetes + " · signaux : " + t.setups;
   list.appendChild(fun);
   j.results.lignes.forEach(l => {
     const d = document.createElement("div");
@@ -463,6 +470,23 @@ RANK = {
     "no_reentry": 4, "no_fvg": 5, "waiting_retrace": 6, "rr_low": 7, "signal": 8,
 }
 ARROW = {"up": "↑", "down": "↓", None: "?"}
+
+
+def real(sym):
+    return RESOLVED.get(sym, sym)
+
+
+def label(sym):
+    return MT5.get(sym, sym)
+
+
+def pick_side(b_d1, b_h4):
+    """Le H4 décide. Le Daily n'a qu'un droit de veto : il interdit seulement un trade contre lui."""
+    if b_h4 is None:
+        return None
+    if b_d1 is not None and b_d1 != b_h4:
+        return None
+    return b_h4
 
 
 def fmt(x):
@@ -655,21 +679,25 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
     else:
         b_d1, b_h4 = structure_bias(d1c, SWING_N), structure_bias(h4c, SWING_N)
     head = "D1 %s · H4 %s" % (ARROW[b_d1], ARROW[b_h4])
-    if b_d1 is None or b_d1 != b_h4:
-        return {"resume": head + " · pas de biais commun, pas de trade"}, None
+    px = " · prix " + fmt((m15f or m15c[-1])["c"])
+    side = pick_side(b_d1, b_h4)
+    if side is None:
+        why = "H4 sans structure claire" if b_h4 is None else "Daily contre le H4"
+        return {"resume": head + " · " + why + ", pas de trade" + px}, None
 
-    buy = (b_d1 == "up")
+    buy = (side == "up")
     zone = "discount" if buy else "premium"
+    rng_src = d1c if PD_RANGE == "D1" else h4c
     if buy:
-        res = evaluate_buy(d1c, h4c, h4f, m15c, m15f)
+        res = evaluate_buy(rng_src, h4c, h4f, m15c, m15f)
     else:
-        res = unmirror(evaluate_buy(mirror(d1c), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f)))
+        res = unmirror(evaluate_buy(mirror(rng_src), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f)))
 
     code = res["code"]
     if RANK[code] >= RANK["no_crt"]:
         head += " · en " + zone
     msgs = {
-        "no_range": "range Daily introuvable",
+        "no_range": "range %s introuvable" % PD_RANGE,
         "not_in_zone": "prix pas en %s (prix %s, équilibre %s)" % (zone, fmt(res.get("price", 0)), fmt(res.get("eq", 0))),
         "no_crt": "pas de CRT H4 en cours",
         "no_sweep": "CRT H4 vu, sweep pas encore visible en M15",
@@ -679,7 +707,7 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
         "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
         "signal": "SETUP A+",
     }
-    info = {"resume": head + " · " + msgs[code], "code": code,
+    info = {"resume": head + " · " + msgs[code] + px, "code": code,
             "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t")}
     if code == "signal":
         sig = dict(res)
@@ -691,15 +719,16 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None):
 def build_text(sym, sig):
     buy = sig["side"] == "buy"
     return "\n".join([
-        "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", sym),
-        "Biais Daily + H4 %s, prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
+        "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", label(sym)),
+        "Biais H4 %s (Daily pas contre), prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
         "CRT H4 : sweep puis retour dans le range",
         "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"])),
         "Entrée repère : %s" % fmt(sig["entry"]),
         "Stop : %s (distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
-        "TP : %s (%s)" % (fmt(sig["tp"]), sig["tp_label"]),
+        "TP : %s (%s, soit %.2f%% du prix)" % (fmt(sig["tp"]), sig["tp_label"], abs(sig["tp"] - sig["entry"]) / abs(sig["entry"]) * 100),
         "Gain/risque : %.1f pour 1" % sig["rr"],
-        "Aucun ordre n'est passé : vérifie sur le graphique avant d'entrer.",
+        "Prix Deriv au signal : %s. Compare avec ton MT5 avant d'entrer." % fmt(sig["price"]),
+        "Aucun ordre n'est passé : vérifie sur le graphique.",
     ])
 
 
@@ -772,9 +801,17 @@ async def load_symbols(ws):
     items.sort(key=lambda x: x[1])
     STATE["available"] = items
     ids = set(x[0] for x in items)
+    for i_, n_ in items:
+        NAMES[i_] = n_
     for sym in SYMBOLS:
         if items and sym not in ids:
-            print("ATTENTION : symbole inconnu chez Deriv :", sym)
+            hint = HINTS.get(sym, "").lower()
+            match = next((i_ for i_, n_ in items if hint and (hint in n_.lower() or hint in i_.lower())), None)
+            if match:
+                RESOLVED[sym] = match
+                print("Marché %s retrouvé par mot-clé : %s" % (sym, match))
+            else:
+                print("ATTENTION : symbole inconnu chez Deriv :", sym)
 
 
 async def send_ntfy(title, text):
@@ -803,7 +840,7 @@ async def handle_signal(sym, sig):
     text = build_text(sym, sig)
     SIGNALS.append({"heure": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", "texte": text})
     print("SIGNAL", sym, sig["side"])
-    await send_ntfy("Setup A+ %s %s" % (sym, "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
+    await send_ntfy("Setup A+ %s %s" % (label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
 
 
 def stale(fetched, now, ttl, gran):
@@ -816,16 +853,18 @@ async def scan_once(ws, cache):
             now = time.time()
             ck, hk = (sym, 86400), (sym, 14400)
             if ck not in cache or stale(cache[ck][0], now, 900, 86400):
-                cache[ck] = (now, await fetch_candles(ws, sym, 86400, 150))
+                cache[ck] = (now, await fetch_candles(ws, real(sym), 86400, 150))
             if hk not in cache or stale(cache[hk][0], now, H4_TTL, 14400):
-                cache[hk] = (now, await fetch_candles(ws, sym, 14400, 300))
-            m15 = await fetch_candles(ws, sym, 900, 300)
+                cache[hk] = (now, await fetch_candles(ws, real(sym), 14400, 300))
+            m15 = await fetch_candles(ws, real(sym), 900, 300)
             info, sig = analyze(sym, cache[ck][1], cache[hk][1], m15, time.time())
         except ApiError as e:
             if "rate" in str(e).lower():
                 STATE["error"] = "limite de requêtes Deriv atteinte, nouvel essai au prochain tour"
                 return
             info, sig = {"resume": "erreur Deriv : %s" % e}, None
+        info["label"] = label(sym)
+        info["nom"] = NAMES.get(real(sym), "")
         STATE["symbols"][sym] = info
         if sig:
             await handle_signal(sym, sig)
@@ -929,7 +968,7 @@ async def replay(d1, h4, m15, start_i):
                           structure_bias(h4[max(0, kh - 300):kh], SWING_N))
         b_d1, b_h4 = cache[key]
         st["steps"] += 1
-        if b_d1 is None or b_d1 != b_h4:
+        if pick_side(b_d1, b_h4) is None:
             continue
         st["bias"] += 1
         if i <= busy:
@@ -966,7 +1005,7 @@ def summarize(sym, trades, st):
     to = sum(1 for t in trades if t["res"] == "timeout")
     op = sum(1 for t in trades if t["res"] == "open")
     total_r = sum(t["r"] for t in trades if t["res"] != "open")
-    return {"symbole": sym, "setups": len(trades), "gagnes": w, "perdus": l,
+    return {"symbole": label(sym), "setups": len(trades), "gagnes": w, "perdus": l,
             "expires": to, "ouverts": op, "r_total": round(total_r, 2),
             "steps": st["steps"], "bias": st["bias"], "zone": st["zone"],
             "crt": len(st["crt"]), "fvg": len(st["fvg"]), "rr_rejetes": len(st["rr"])}
@@ -1014,14 +1053,14 @@ async def run_backtest():
             tag = "%d/%d %s" % (n + 1, len(SYMBOLS), sym)
             BT["progress"] = tag + " : téléchargement des bougies..."
             try:
-                d1 = await fetch_history(ws, sym, 86400, 400, 400)
-                h4 = await fetch_history(ws, sym, 14400, 1500, 1500)
-                m15 = await fetch_history(ws, sym, 900, (BT_DAYS + 4) * 96, 4000)
+                d1 = await fetch_history(ws, real(sym), 86400, 400, 400)
+                h4 = await fetch_history(ws, real(sym), 14400, 1500, 1500)
+                m15 = await fetch_history(ws, real(sym), 900, (BT_DAYS + 4) * 96, 4000)
             except ApiError as e:
-                rows.append({"symbole": sym, "erreur": str(e)})
+                rows.append({"symbole": label(sym), "erreur": str(e)})
                 continue
             if len(m15) < 400:
-                rows.append({"symbole": sym, "erreur": "pas assez d'historique (%d bougies M15)" % len(m15)})
+                rows.append({"symbole": label(sym), "erreur": "pas assez d'historique (%d bougies M15)" % len(m15)})
                 continue
             BT["progress"] = tag + " : analyse..."
             start_t = m15[-1]["t"] - BT_DAYS * 86400
