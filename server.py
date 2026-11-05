@@ -315,7 +315,9 @@ async function loadBacktest() {
     c.lignes.forEach(l => {
       const d = document.createElement("div");
       d.style.marginTop = "4px";
-      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R · PF " + (l.profit_factor === null ? "—" : (l.profit_factor === "inf" ? "∞" : l.profit_factor)) + " · DD " + l.max_drawdown_r + " R (achats " + l.achats + " : " + sign(l.r_achats) + " R, ventes " + l.ventes + " : " + sign(l.r_ventes) + " R)");
+      const bpf = l.achats_pf === null ? "—" : (l.achats_pf === "inf" ? "∞" : l.achats_pf);
+      const spf = l.ventes_pf === null ? "—" : (l.ventes_pf === "inf" ? "∞" : l.ventes_pf);
+      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R · PF " + (l.profit_factor === null ? "—" : (l.profit_factor === "inf" ? "∞" : l.profit_factor)) + " · DD " + l.max_drawdown_r + " R · ACHATS " + l.achats + " trades / " + sign(l.r_achats) + " R / PF " + bpf + " / esp. " + sign(l.achats_expectancy_r) + " R · VENTES " + l.ventes + " trades / " + sign(l.r_ventes) + " R / PF " + spf + " / esp. " + sign(l.ventes_expectancy_r) + " R");
       det.appendChild(d);
     });
     list.appendChild(det);
@@ -1158,14 +1160,21 @@ def summarize(sym, trades):
     buys = [t for t in closed if t["side"] == "buy"]
     sells = [t for t in closed if t["side"] == "sell"]
     stats = performance_stats(closed)
+    buy_stats = performance_stats(buys)
+    sell_stats = performance_stats(sells)
     return {"symbole": label(sym), "achats": len(buys), "r_achats": round(sum(t["r"] for t in buys), 2),
-            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades),
+            "achats_pf": buy_stats["profit_factor"], "achats_dd_r": buy_stats["max_drawdown_r"],
+            "achats_expectancy_r": buy_stats["expectancy_r"],
+            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2),
+            "ventes_pf": sell_stats["profit_factor"], "ventes_dd_r": sell_stats["max_drawdown_r"],
+            "ventes_expectancy_r": sell_stats["expectancy_r"], "setups": len(trades),
             "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2),
             "profit_factor": stats["profit_factor"], "max_drawdown_r": stats["max_drawdown_r"],
             "expectancy_r": stats["expectancy_r"]}
 
 
-def combo_total(trades, split_t):
+def combo_total(trades, window_start, window_end):
+    split_t = window_end - (window_end - window_start) / 3
     # Les trades encore ouverts ne sont pas inclus dans les performances réalisées.
     closed = sorted((t for t in trades if t["res"] != "open"), key=lambda t: t["t"])
     old = [t for t in closed if t["t"] < split_t]
@@ -1173,19 +1182,15 @@ def combo_total(trades, split_t):
     total_r = sum(t["r"] for t in closed)
     stats = performance_stats(closed)
 
-    # Trois périodes chronologiques de même durée sur l'intervalle observé.
+    # Trois périodes calendaires fixes sur la fenêtre complète du backtest,
+    # y compris les périodes sans aucun trade.
     periods = []
-    if closed:
-        t_min = min(t["t"] for t in closed)
-        t_max = max(t["t"] for t in closed)
-        span = max(1, t_max - t_min + 1)
-        for idx in range(3):
-            lo = t_min + span * idx / 3
-            hi = t_min + span * (idx + 1) / 3
-            group = [t for t in closed if lo <= t["t"] < hi or (idx == 2 and t["t"] == t_max)]
-            periods.append({"n": len(group), "r": round(sum(t["r"] for t in group), 2)})
-    else:
-        periods = [{"n": 0, "r": 0.0} for _ in range(3)]
+    span = max(1, window_end - window_start)
+    for idx in range(3):
+        lo = window_start + span * idx / 3
+        hi = window_start + span * (idx + 1) / 3
+        group = [t for t in closed if lo <= t["t"] < hi or (idx == 2 and t["t"] == window_end)]
+        periods.append({"n": len(group), "r": round(sum(t["r"] for t in group), 2)})
 
     buys = performance_stats([t for t in closed if t["side"] == "buy"])
     sells = performance_stats([t for t in closed if t["side"] == "sell"])
@@ -1257,6 +1262,8 @@ async def run_backtest():
         alltr = {(m, t): [] for m in BT_MODES for t in BT_THRS}
         funnel = {m: {"steps": 0, "bias": 0, "zone": 0, "crt": 0, "fvg": 0, "rr": 0} for m in BT_MODES}
         split_t = 0
+        window_end = int(time.time() // 900) * 900
+        window_start = window_end - BT_DAYS * 86400
         n_ok = 0
         for n, sym in enumerate(SYMBOLS):
             tag = "%d/%d %s" % (n + 1, len(SYMBOLS), sym)
@@ -1266,6 +1273,8 @@ async def run_backtest():
                 d1 = await fetch_history(ws, real(sym), 86400, 400, 400)
                 h4 = await fetch_history(ws, real(sym), 14400, 1500, 1500)
                 m15 = await fetch_history(ws, real(sym), 900, (BT_DAYS + 4) * 96, 4000)
+                # Ne jamais traiter la bougie M15 encore en formation comme clôturée.
+                m15 = [c for c in m15 if int(c["t"]) + 900 <= int(time.time())]
                 if len(m15) < 400:
                     err = "pas assez d'historique (%d bougies M15)" % len(m15)
             except ApiError as e:
@@ -1275,8 +1284,8 @@ async def run_backtest():
                     rows[k].append({"symbole": label(sym), "erreur": err})
                 continue
             n_ok += 1
-            split_t = max(split_t, m15[-1]["t"] - (BT_DAYS // 3) * 86400)
-            start_t = m15[-1]["t"] - BT_DAYS * 86400
+            split_t = window_end - (BT_DAYS // 3) * 86400
+            start_t = window_start
             start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
             for mode in BT_MODES:
                 BT["progress"] = tag + " : analyse (" + mode + ")..."
@@ -1294,9 +1303,11 @@ async def run_backtest():
         combos = []
         for mode in BT_MODES:
             for thr in BT_THRS:
-                combos.append({"mode": mode, "min_rr": thr, "total": combo_total(alltr[(mode, thr)], split_t),
+                combos.append({"mode": mode, "min_rr": thr, "total": combo_total(alltr[(mode, thr)], window_start, window_end),
                                "lignes": rows[(mode, thr)]})
-        BT["results"] = {"jours": BT_DAYS, "jours_new": BT_DAYS // 3, "marches": n_ok,
+        BT["results"] = {"jours": BT_DAYS, "jours_new": BT_DAYS // 3,
+                         "fenetre_debut_utc": window_start, "fenetre_fin_utc": window_end,
+                         "bougies_m15_incompletes_exclues": True, "marches": n_ok,
                          "entonnoir": funnel, "combos": combos}
         BT["done"] = True
         BT["progress"] = "terminé"
