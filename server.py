@@ -307,12 +307,15 @@ async function loadBacktest() {
     audit.style.padding = "8px";
     audit.style.background = "rgba(255,255,255,.04)";
     const p = t.periods || [];
-    audit.textContent = "Robustesse : sans le meilleur trade " + sign(t.sans_best1_r) + " R ; sans les 2 meilleurs " + sign(t.sans_best2_r) + " R. Périodes chronologiques : " + p.map((x, i) => "P" + (i + 1) + " " + x.n + " trades / " + sign(x.r) + " R").join(" · ");
+    const pf = t.profit_factor === null ? "—" : (t.profit_factor === "inf" ? "∞" : t.profit_factor);
+    audit.textContent = "Audit : PF " + pf + " · espérance " + sign(t.expectancy_r) + " R/trade · drawdown max " + t.max_drawdown_r + " R · série max pertes " + t.max_pertes_consecutives +
+      " · sans top 1/2/3/5 : " + [t.sans_best1_r, t.sans_best2_r, t.sans_best3_r, t.sans_best5_r].map(x => sign(x) + " R").join(" / ") +
+      " · périodes : " + p.map((x, i) => "P" + (i + 1) + " " + x.n + " trades / " + sign(x.r) + " R").join(" · ");
     det.appendChild(audit);
     c.lignes.forEach(l => {
       const d = document.createElement("div");
       d.style.marginTop = "4px";
-      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R (achats " + l.achats + " : " + sign(l.r_achats) + " R, ventes " + l.ventes + " : " + sign(l.r_ventes) + " R)");
+      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R · PF " + (l.profit_factor === null ? "—" : (l.profit_factor === "inf" ? "∞" : l.profit_factor)) + " · DD " + l.max_drawdown_r + " R (achats " + l.achats + " : " + sign(l.r_achats) + " R, ventes " + l.ventes + " : " + sign(l.r_ventes) + " R)");
       det.appendChild(d);
     });
     list.appendChild(det);
@@ -521,6 +524,11 @@ def pick_side(b_d1, b_h4):
     if b_d1 is not None and b_d1 != b_h4:
         return None
     return b_h4
+
+
+def side_allowed(only, side):
+    """Applique la restriction directionnelle identique au scanner et au backtest."""
+    return not only or ((only == "buy") == (side == "up"))
 
 
 def fmt(x):
@@ -762,7 +770,7 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, m
         why = "H4 sans structure claire" if b_h4 is None else "Daily contre le H4"
         return {"resume": head + " · " + why + ", pas de trade" + px}, None
 
-    if only and ((only == "buy") != (side == "up")):
+    if not side_allowed(only, side):
         return {"resume": head + " · ici on ne trade que les %s (spikes), mais le H4 est %s : pas de trade%s" % (
             "achats" if only == "buy" else "ventes", "haussier" if side == "up" else "baissier", px)}, None
 
@@ -1063,7 +1071,7 @@ async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
         b_d1, b_h4 = cache[key]
         st["steps"] += 1
         side = pick_side(b_d1, b_h4)
-        if side is None or (only and ((only == "buy") != (side == "up"))):
+        if side is None or not side_allowed(only, side):
             continue
         st["bias"] += 1
         free = [t for t in thresholds if i > busy[t]]
@@ -1103,33 +1111,69 @@ async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
     return trades, st
 
 
+def performance_stats(trades):
+    """Mesures calculées sur les trades clôturés, dans l'ordre chronologique."""
+    ordered = sorted((t for t in trades if t["res"] != "open"), key=lambda t: t["t"])
+    rs = [float(t["r"]) for t in ordered]
+    gross_win = sum(r for r in rs if r > 0)
+    gross_loss = -sum(r for r in rs if r < 0)
+    equity = peak = max_dd = 0.0
+    loss_streak = win_streak = max_loss_streak = max_win_streak = 0
+    for r in rs:
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+        if r < 0:
+            loss_streak += 1
+            win_streak = 0
+        elif r > 0:
+            win_streak += 1
+            loss_streak = 0
+        else:
+            loss_streak = win_streak = 0
+        max_loss_streak = max(max_loss_streak, loss_streak)
+        max_win_streak = max(max_win_streak, win_streak)
+    n = len(rs)
+    return {
+        "n_clos": n,
+        "expectancy_r": round(sum(rs) / n, 3) if n else 0.0,
+        "profit_factor": round(gross_win / gross_loss, 3) if gross_loss else (None if not gross_win else "inf"),
+        "max_drawdown_r": round(max_dd, 2),
+        "max_pertes_consecutives": max_loss_streak,
+        "max_gains_consecutifs": max_win_streak,
+        "sans_best1_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:1]), 2),
+        "sans_best2_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:2]), 2),
+        "sans_best3_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:3]), 2),
+        "sans_best5_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:5]), 2),
+    }
+
+
 def summarize(sym, trades):
+    closed = [t for t in trades if t["res"] != "open"]
     w = sum(1 for t in trades if t["res"] == "win")
     l = sum(1 for t in trades if t["res"] == "loss")
     to = sum(1 for t in trades if t["res"] == "timeout")
     op = sum(1 for t in trades if t["res"] == "open")
-    total_r = sum(t["r"] for t in trades if t["res"] != "open")
-    buys = [t for t in trades if t["side"] == "buy" and t["res"] != "open"]
-    sells = [t for t in trades if t["side"] == "sell" and t["res"] != "open"]
+    total_r = sum(t["r"] for t in closed)
+    buys = [t for t in closed if t["side"] == "buy"]
+    sells = [t for t in closed if t["side"] == "sell"]
+    stats = performance_stats(closed)
     return {"symbole": label(sym), "achats": len(buys), "r_achats": round(sum(t["r"] for t in buys), 2),
             "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades),
-            "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2)}
+            "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2),
+            "profit_factor": stats["profit_factor"], "max_drawdown_r": stats["max_drawdown_r"],
+            "expectancy_r": stats["expectancy_r"]}
 
 
 def combo_total(trades, split_t):
     # Les trades encore ouverts ne sont pas inclus dans les performances réalisées.
-    closed = [t for t in trades if t["res"] != "open"]
+    closed = sorted((t for t in trades if t["res"] != "open"), key=lambda t: t["t"])
     old = [t for t in closed if t["t"] < split_t]
     new = [t for t in closed if t["t"] >= split_t]
-    ordered = sorted(closed, key=lambda t: t["r"], reverse=True)
     total_r = sum(t["r"] for t in closed)
-
-    # Concentration : résultat après retrait du ou des meilleurs trades.
-    best1 = ordered[0]["r"] if ordered else 0.0
-    best2 = sum(t["r"] for t in ordered[:2])
+    stats = performance_stats(closed)
 
     # Trois périodes chronologiques de même durée sur l'intervalle observé.
-    # Les bornes sont calculées sur les trades effectivement clôturés.
     periods = []
     if closed:
         t_min = min(t["t"] for t in closed)
@@ -1143,6 +1187,8 @@ def combo_total(trades, split_t):
     else:
         periods = [{"n": 0, "r": 0.0} for _ in range(3)]
 
+    buys = performance_stats([t for t in closed if t["side"] == "buy"])
+    sells = performance_stats([t for t in closed if t["side"] == "sell"])
     return {"setups": len(trades),
             "gagnes": sum(1 for t in trades if t["res"] == "win"),
             "perdus": sum(1 for t in trades if t["res"] == "loss"),
@@ -1151,11 +1197,19 @@ def combo_total(trades, split_t):
             "r_total": round(total_r, 2),
             "n_old": len(old), "r_old": round(sum(t["r"] for t in old), 2),
             "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2),
-            "best1_r": round(best1, 2),
-            "sans_best1_r": round(total_r - best1, 2),
-            "best2_r": round(best2, 2),
-            "sans_best2_r": round(total_r - best2, 2),
-            "periods": periods}
+            "periods": periods,
+            "profit_factor": stats["profit_factor"],
+            "expectancy_r": stats["expectancy_r"],
+            "max_drawdown_r": stats["max_drawdown_r"],
+            "max_pertes_consecutives": stats["max_pertes_consecutives"],
+            "max_gains_consecutifs": stats["max_gains_consecutifs"],
+            "sans_best1_r": stats["sans_best1_r"],
+            "sans_best2_r": stats["sans_best2_r"],
+            "sans_best3_r": stats["sans_best3_r"],
+            "sans_best5_r": stats["sans_best5_r"],
+            "achats_pf": buys["profit_factor"], "ventes_pf": sells["profit_factor"],
+            "achats_r": round(sum(t["r"] for t in closed if t["side"] == "buy"), 2),
+            "ventes_r": round(sum(t["r"] for t in closed if t["side"] == "sell"), 2)}
 
 
 async def hist_request(ws, payload):
