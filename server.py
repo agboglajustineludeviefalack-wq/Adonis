@@ -162,7 +162,7 @@ HTML_CONTENT = r"""
     <h3>📡 Marché en direct</h3>
     <select id="marketSelect" onchange="subscribeTicker()"></select>
     <div>Prix : <span id="livePrice" class="live-price">--</span></div>
-    <p class="small">Cette zone affiche seulement le prix. L'analyse A+ est faite par le scanner du serveur (carte ci-dessus).</p>
+    <p class="small">Cette zone affiche seulement le prix. Le classement A+/A/B est fait par le scanner du serveur (carte ci-dessus).</p>
   </div>
 
   <div class="card">
@@ -510,6 +510,93 @@ RANK = {
 }
 ARROW = {"up": "↑", "down": "↓", None: "?"}
 
+# Profils historiques issus du backtest CRT clôture M15 (180 jours, RR >= 2).
+# Une donnée absente n'est PAS considérée comme une preuve de rentabilité.
+# USDJPY est le seul marché clairement défavorable dans les résultats communiqués :
+# les achats comme les ventes sont négatifs, et les ventes RR>=2 ont fait 6 pertes/6.
+# Les autres marchés restent à confirmer par un échantillon directionnel suffisant.
+MARKET_HISTORY = {
+    "frxUSDJPY": {"buy": {"status": "weak", "note": "historique négatif dans les trois seuils RR testés"},
+                  "sell": {"status": "weak", "note": "6 ventes RR>=2, 6 pertes (-6R) ; historique négatif"}},
+}
+HISTORY_MIN_TRADES = 20
+HISTORY_MIN_PF = 1.25
+HISTORY_MIN_EXPECTANCY = 0.15
+
+
+def classify_setup(sym, sig):
+    """Classe le signal sans confondre qualité technique et preuve statistique."""
+    side = sig["side"]
+    rr = float(sig.get("rr", 0.0) or 0.0)
+    hist = MARKET_HISTORY.get(sym, {}).get(side)
+
+    # Qualité technique : le CRT, le sweep et la clôture M15 de réintégration
+    # sont déjà obligatoires pour qu'un signal soit produit. Le RR départage ici.
+    if rr < 2.0:
+        technical = "B"
+    elif rr >= 3.5:
+        technical = "A+"
+    else:
+        technical = "A"
+
+    # A+ exige en plus un historique directionnel robuste, pas seulement un beau RR.
+    if hist and hist.get("status") == "weak":
+        return "B", "marché/sens historiquement défavorable : " + hist.get("note", "prudence")
+
+    if hist and hist.get("status") == "validated":
+        n = int(hist.get("n", 0))
+        pf = hist.get("pf")
+        expectancy = hist.get("expectancy", 0.0)
+        if (n >= HISTORY_MIN_TRADES and pf is not None and pf >= HISTORY_MIN_PF
+                and expectancy >= HISTORY_MIN_EXPECTANCY and technical == "A+"):
+            return "A+", "historique directionnel validé (%d trades, PF %s, espérance %sR)" % (
+                n, pf, expectancy)
+
+    if technical == "B":
+        return "B", "qualité technique insuffisante"
+    if hist and hist.get("status") == "promising":
+        return "A", "historique prometteur mais échantillon trop faible pour A+"
+    return "A", "technique propre, mais historique directionnel pas encore validé pour A+"
+
+
+def refresh_market_history(alltr):
+    """Actualise les profils directionnels depuis le backtest CRT clôture RR>=2."""
+    global MARKET_HISTORY
+    trades = alltr.get(("close", 2.0), [])
+    refreshed = dict(MARKET_HISTORY)
+    symbols = sorted({t.get("sym") for t in trades if t.get("sym")})
+    for sym in symbols:
+        per_side = dict(refreshed.get(sym, {}))
+        for side in ("buy", "sell"):
+            group = [t for t in trades if t.get("sym") == sym and t.get("side") == side
+                     and t.get("res") != "open"]
+            if not group:
+                continue
+            stats = performance_stats(group)
+            n = stats["n_clos"]
+            # Ne remplace pas un avertissement historique documenté par un
+            # échantillon trop petit du backtest courant.
+            if n < 8:
+                continue
+            pf = stats["profit_factor"]
+            expectancy = stats["expectancy_r"]
+            numeric_pf = pf if isinstance(pf, (int, float)) else (float("inf") if pf == "inf" else None)
+            if (n >= HISTORY_MIN_TRADES and numeric_pf is not None
+                    and numeric_pf >= HISTORY_MIN_PF
+                    and expectancy >= HISTORY_MIN_EXPECTANCY):
+                status = "validated"
+            elif n >= 8 and ((numeric_pf is not None and numeric_pf < 1.0) or expectancy < 0):
+                status = "weak"
+            elif n >= 8 and expectancy > 0 and numeric_pf is not None and numeric_pf > 1.0:
+                status = "promising"
+            else:
+                status = "insufficient"
+            per_side[side] = {"status": status, "n": n, "pf": pf,
+                              "expectancy": expectancy,
+                              "note": "backtest CRT clôture RR>=2 actualisé"}
+        refreshed[sym] = per_side
+    MARKET_HISTORY = refreshed
+
 
 def real(sym):
     return RESOLVED.get(sym, sym)
@@ -752,7 +839,15 @@ def analyze(sym, d1, h4, m15, now):
     d1c, _ = split_closed(d1, 86400, now)
     h4c, h4f = split_closed(h4, 14400, now)
     m15c, m15f = split_closed(m15, 900, now)
-    return analyze_core(d1c, h4c, h4f, m15c, m15f, None, SIDE_ONLY.get(sym))
+    info, sig = analyze_core(d1c, h4c, h4f, m15c, m15f, None, SIDE_ONLY.get(sym))
+    if sig:
+        grade, reason = classify_setup(sym, sig)
+        sig["grade"] = grade
+        sig["grade_reason"] = reason
+        info["grade"] = grade
+        info["grade_reason"] = reason
+        info["resume"] = info["resume"].replace("SETUP À CLASSER", "SETUP " + grade)
+    return info, sig
 
 
 def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, min_rr=None):
@@ -796,7 +891,7 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, m
         "no_fvg": ("retour dans le range, pas de FVG M15 valide" if mode == "fvg" else "retour dans le range déjà passé (l'entrée se fait à la clôture de cette bougie)"),
         "waiting_retrace": "FVG M15 repéré, attente d'une bougie de retest clôturée",
         "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
-        "signal": "SETUP A+",
+        "signal": "SETUP À CLASSER",
     }
     info = {"resume": head + " · " + msgs[code] + px, "code": code,
             "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t"), "rr": res.get("rr")}
@@ -810,7 +905,8 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, m
 def build_text(sym, sig):
     buy = sig["side"] == "buy"
     return "\n".join([
-        "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", label(sym)),
+        "%s %s - Setup %s" % ("ACHAT" if buy else "VENTE", label(sym), sig.get("grade", "B")),
+        "Classement : %s" % sig.get("grade_reason", "historique directionnel non validé"),
         "Biais H4 %s (Daily pas contre), prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
         "CRT H4 : sweep puis retour dans le range",
         ("Entrée au marché, à la clôture M15 de réintégration" if sig["fvg_bottom"] == sig["fvg_top"]
@@ -933,7 +1029,7 @@ async def handle_signal(sym, sig):
     text = build_text(sym, sig)
     SIGNALS.append({"heure": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", "texte": text})
     print("SIGNAL", sym, sig["side"])
-    await send_ntfy("Setup A+ %s %s" % (label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
+    await send_ntfy("Setup %s %s %s" % (sig.get("grade", "B"), label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
 
 
 def stale(fetched, now, ttl, gran):
@@ -1292,6 +1388,8 @@ async def run_backtest():
                 trs, st = await replay(d1, h4, m15, start_i, SIDE_ONLY.get(sym), mode, BT_THRS)
                 for thr in BT_THRS:
                     rows[(mode, thr)].append(summarize(sym, trs[thr]))
+                    for trade in trs[thr]:
+                        trade["sym"] = sym
                     alltr[(mode, thr)].extend(trs[thr])
                 f = funnel[mode]
                 f["steps"] += st["steps"]
@@ -1300,6 +1398,7 @@ async def run_backtest():
                 f["crt"] += len(st["crt"])
                 f["fvg"] += len(st["fvg"])
                 f["rr"] += len(st["rr"])
+        refresh_market_history(alltr)
         combos = []
         for mode in BT_MODES:
             for thr in BT_THRS:
