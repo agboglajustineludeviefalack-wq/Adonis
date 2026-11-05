@@ -58,6 +58,9 @@ MT5 = {
 SIDE_ONLY = {"BOOM500": "buy", "BOOM1000": "buy", "CRASH500": "sell", "CRASH1000": "sell"}
 RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
 NAMES = {}      # code Deriv -> nom affiché par Deriv
+ENTRY_MODE = os.environ.get("ENTRY_MODE", "fvg").lower()  # "fvg" = retour sur le FVG, "close" = à la clôture du retour dans le range
+if ENTRY_MODE not in ("fvg", "close"):
+    ENTRY_MODE = "fvg"
 PD_RANGE = os.environ.get("PD_RANGE", "H4").upper()    # range du discount/premium : H4 ou D1
 SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté d'un sommet/creux
 MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
@@ -260,6 +263,12 @@ async function startBacktest() {
   loadBacktest();
 }
 
+const MODE_NAMES = {
+  fvg: "Entrée sur retour au FVG",
+  close: "Entrée à la clôture du retour dans le range"
+};
+const sign = x => (Number(x) >= 0 ? "+" : "") + x;
+
 async function loadBacktest() {
   let r;
   try { r = await fetch("/api/backtest"); } catch (e) { return; }
@@ -273,23 +282,39 @@ async function loadBacktest() {
   const list = $("btList");
   list.innerHTML = "";
   if (!j.results) return;
-  const t = j.results.total;
-  const head = document.createElement("div");
-  head.className = "log-item";
-  head.style.borderLeftColor = "#22c55e";
-  head.textContent = "TOTAL (" + j.results.jours + " jours) : " + t.setups + " setups · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + t.expires + " sans issue · " + (t.r_total >= 0 ? "+" : "") + t.r_total + " R" + (t.setups < 30 ? " — échantillon trop petit pour conclure" : "");
-  list.appendChild(head);
+  const res = j.results;
   const pct = (a, b) => b ? Math.round(a * 100 / b) : 0;
-  const fun = document.createElement("div");
-  fun.className = "log-item";
-  fun.textContent = "Entonnoir (" + t.marches + " marchés) : biais H4 exploitable (Daily pas contre) " + pct(t.bias, t.steps) + " % du temps · prix du bon côté de l'équilibre " + pct(t.zone, t.steps) + " % · CRT H4 avec sweep : " + t.crt + " · FVG M15 formés : " + t.fvg + " · rejetés par gain/risque : " + t.rr_rejetes + " · signaux : " + t.setups;
-  list.appendChild(fun);
-  j.results.lignes.forEach(l => {
+  ["fvg", "close"].forEach(mode => {
+    const f = res.entonnoir[mode];
+    const c2 = res.combos.find(c => c.mode === mode && c.min_rr === 2);
     const d = document.createElement("div");
     d.className = "log-item";
-    d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " setups · " + l.gagnes + " gagnés · " + l.perdus + " perdus · " + (l.r_total >= 0 ? "+" : "") + l.r_total + " R (achats " + l.achats + " : " + (l.r_achats >= 0 ? "+" : "") + l.r_achats + " R, ventes " + l.ventes + " : " + (l.r_ventes >= 0 ? "+" : "") + l.r_ventes + " R) · biais " + pct(l.bias, l.steps) + " % · CRT " + l.crt + " · FVG " + l.fvg + " · rejetés RR " + l.rr_rejetes);
+    d.textContent = MODE_NAMES[mode] + " — entonnoir (" + res.marches + " marchés, " + res.jours + " jours) : biais H4 exploitable " + pct(f.bias, f.steps) + " % du temps · bon côté de l'équilibre " + pct(f.zone, f.steps) + " % · CRT avec sweep : " + f.crt + " · entrées possibles : " + f.fvg + " · gain/risque < 2 : " + f.rr + " · signaux (RR ≥ 2) : " + (c2 ? c2.total.setups : 0);
     list.appendChild(d);
   });
+  res.combos.forEach(c => {
+    const t = c.total;
+    const done = t.gagnes + t.perdus + t.expires;
+    const per = done ? (t.r_total / done).toFixed(2) : "0.00";
+    const det = document.createElement("details");
+    det.className = "log-item";
+    det.style.borderLeftColor = t.r_total > 0 ? "#22c55e" : "#ef4444";
+    const sm = document.createElement("summary");
+    sm.textContent = MODE_NAMES[c.mode] + " · RR ≥ " + c.min_rr + " : " + t.setups + " trades · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + sign(t.r_total) + " R (" + sign(per) + " R/trade) · avant les " + res.jours_new + " derniers jours : " + t.n_old + " trades, " + sign(t.r_old) + " R · " + res.jours_new + " derniers jours : " + t.n_new + " trades, " + sign(t.r_new) + " R";
+    det.appendChild(sm);
+    c.lignes.forEach(l => {
+      const d = document.createElement("div");
+      d.style.marginTop = "4px";
+      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R (achats " + l.achats + " : " + sign(l.r_achats) + " R, ventes " + l.ventes + " : " + sign(l.r_ventes) + " R)");
+      det.appendChild(d);
+    });
+    list.appendChild(det);
+  });
+  const note = document.createElement("div");
+  note.className = "small";
+  note.style.marginTop = "6px";
+  note.textContent = "Rappel : sans spread ni commission. Moins de 100 trades par variante = on ne peut rien conclure.";
+  list.appendChild(note);
 }
 
 async function init() {
@@ -564,40 +589,46 @@ def pick_tp(entry, h4c, c1_high):
     return tp, label
 
 
-def find_entry(c1, c2, m15c, allm, h4c):
+def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None):
+    min_rr = MIN_RR if min_rr is None else min_rr
     win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
     s = next((i for i, m in win if m["l"] < c1["l"]), None)
     if s is None:
         return {"code": "no_sweep", "c1_t": c1["t"]}
-    j = next((i for i in range(s, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
+    j = next((i for i in range(s + 1, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
     if j is None:
         return {"code": "no_reentry", "c1_t": c1["t"]}
-    sweep_low = min(m["l"] for _, m in win)
+    base = {"c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"]}
 
-    cands = []
-    for i in range(s, len(m15c) - 2):
-        a, c = m15c[i], m15c[i + 2]
-        if i + 2 >= j and c["l"] > a["h"]:
-            bottom, top = a["h"], c["l"]
-            if all(m15c[k]["c"] >= bottom for k in range(i + 3, len(m15c))):
-                cands.append((i, bottom, top))
-    if not cands:
-        return {"code": "no_fvg", "c1_t": c1["t"]}
-    i, bottom, top = cands[-1]
-    price = allm[-1]["c"]
-    if price < bottom:
-        return {"code": "no_fvg", "c1_t": c1["t"]}
+    if mode == "close":
+        # entrée au marché à la clôture de la 1re bougie M15 qui revient dans le range du CRT
+        if j != len(m15c) - 1:
+            return dict(base, code="no_fvg")
+        sweep_low = min(m["l"] for _, m in win if m["t"] <= m15c[j]["t"])
+        entry = m15c[j]["c"]
+        out = dict(base, fvg_bottom=entry, fvg_top=entry, fvg_t=m15c[j]["t"], sweep_low=sweep_low)
+    else:
+        sweep_low = min(m["l"] for _, m in win)
+        cands = []
+        for i in range(s, len(m15c) - 2):
+            a, c = m15c[i], m15c[i + 2]
+            if i + 2 >= j and c["l"] > a["h"]:
+                bottom, top = a["h"], c["l"]
+                if all(m15c[k]["c"] >= bottom for k in range(i + 3, len(m15c))):
+                    cands.append((i, bottom, top))
+        if not cands:
+            return dict(base, code="no_fvg")
+        i, bottom, top = cands[-1]
+        price = allm[-1]["c"]
+        if price < bottom:
+            return dict(base, code="no_fvg")
+        out = dict(base, fvg_bottom=bottom, fvg_top=top, fvg_t=m15c[i]["t"], sweep_low=sweep_low)
+        touch = [k for k in range(i + 3, len(allm)) if allm[k]["l"] <= top]
+        if not touch or touch[-1] < len(allm) - 3:
+            out["code"] = "waiting_retrace"
+            return out
+        entry = top
 
-    out = {
-        "fvg_bottom": bottom, "fvg_top": top, "fvg_t": m15c[i]["t"],
-        "sweep_low": sweep_low, "c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"],
-    }
-    touch = [k for k in range(i + 3, len(allm)) if allm[k]["l"] <= top]
-    if not touch or touch[-1] < len(allm) - 3:
-        out["code"] = "waiting_retrace"
-        return out
-
-    entry = top
     if entry <= sweep_low:
         out["code"] = "rr_low"
         return out
@@ -607,11 +638,11 @@ def find_entry(c1, c2, m15c, allm, h4c):
         return out
     rr = (tp - entry) / (entry - sweep_low)
     out.update(entry=entry, sl=sweep_low, tp=tp, tp_label=label, rr=rr)
-    out["code"] = "signal" if rr >= MIN_RR else "rr_low"
+    out["code"] = "signal" if rr >= min_rr else "rr_low"
     return out
 
 
-def evaluate_buy(d1c, h4c, h4f, m15c, m15f):
+def evaluate_buy(d1c, h4c, h4f, m15c, m15f, mode="fvg", min_rr=None):
     allm = m15c + ([m15f] if m15f else [])
     price = allm[-1]["c"]
     rng = dealing_range_up(d1c, SWING_N)
@@ -634,7 +665,7 @@ def evaluate_buy(d1c, h4c, h4f, m15c, m15f):
             continue  # pas de sweep du bas, ou les deux côtés balayés
         if closed and not (c1["l"] < c2["c"] <= c1["h"]):
             continue  # la bougie 2 n'a pas clôturé dans le range
-        res = dict(base, **find_entry(c1, c2, m15c, allm, h4c))
+        res = dict(base, **find_entry(c1, c2, m15c, allm, h4c, mode, min_rr))
         if RANK[res["code"]] > RANK[best["code"]]:
             best = res
     return best
@@ -671,8 +702,9 @@ def analyze(sym, d1, h4, m15, now):
     return analyze_core(d1c, h4c, h4f, m15c, m15f, None, SIDE_ONLY.get(sym))
 
 
-def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None):
+def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, min_rr=None):
     """Retourne (infos_pour_la_page, signal_ou_None)."""
+    mode = mode or ENTRY_MODE
     if len(d1c) < 15 or len(h4c) < 15 or len(m15c) < 15:
         return {"resume": "pas assez de bougies reçues (D1 %d, H4 %d, M15 %d)" % (len(d1c), len(h4c), len(m15c))}, None
 
@@ -695,9 +727,9 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None):
     zone = "discount" if buy else "premium"
     rng_src = d1c if PD_RANGE == "D1" else h4c
     if buy:
-        res = evaluate_buy(rng_src, h4c, h4f, m15c, m15f)
+        res = evaluate_buy(rng_src, h4c, h4f, m15c, m15f, mode, min_rr)
     else:
-        res = unmirror(evaluate_buy(mirror(rng_src), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f)))
+        res = unmirror(evaluate_buy(mirror(rng_src), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f), mode, min_rr))
 
     code = res["code"]
     if RANK[code] >= RANK["no_crt"]:
@@ -708,13 +740,13 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None):
         "no_crt": "pas de CRT H4 en cours",
         "no_sweep": "CRT H4 vu, sweep pas encore visible en M15",
         "no_reentry": "sweep fait, pas encore de clôture M15 dans le range",
-        "no_fvg": "retour dans le range, pas de FVG M15 valide",
+        "no_fvg": ("retour dans le range, pas de FVG M15 valide" if mode == "fvg" else "retour dans le range déjà passé (l'entrée se fait à la clôture de cette bougie)"),
         "waiting_retrace": "FVG M15 repéré, attente du retour du prix dessus",
         "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
         "signal": "SETUP A+",
     }
     info = {"resume": head + " · " + msgs[code] + px, "code": code,
-            "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t")}
+            "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t"), "rr": res.get("rr")}
     if code == "signal":
         sig = dict(res)
         sig["side"] = "buy" if buy else "sell"
@@ -728,7 +760,8 @@ def build_text(sym, sig):
         "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", label(sym)),
         "Biais H4 %s (Daily pas contre), prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
         "CRT H4 : sweep puis retour dans le range",
-        "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"])),
+        ("Entrée au marché, à la clôture de la bougie M15 de retour dans le range" if sig["fvg_bottom"] == sig["fvg_top"]
+         else "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"]))),
         "Entrée repère : %s" % fmt(sig["entry"]),
         "Stop : %s (distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
         "TP : %s (%s, soit %.2f%% du prix)" % (fmt(sig["tp"]), sig["tp_label"], abs(sig["tp"] - sig["entry"]) / abs(sig["entry"]) * 100),
@@ -952,13 +985,18 @@ def simulate(sig, m15, i, max_bars=288):
     return ("timeout" if i + max_bars < len(m15) else "open"), r, last_j
 
 
-async def replay(d1, h4, m15, start_i, only=None):
+FUNNEL_RR = 2.0
+
+
+async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
+    thresholds = tuple(thresholds or (MIN_RR,))
+    lo_rr = min(thresholds)
     d1_t = [c["t"] for c in d1]
     h4_t = [c["t"] for c in h4]
     cache = {}
-    seen = set()
-    trades = []
-    busy = -1
+    seen = {t: set() for t in thresholds}
+    trades = {t: [] for t in thresholds}
+    busy = {t: -1 for t in thresholds}
     st = {"steps": 0, "bias": 0, "zone": 0, "crt": set(), "fvg": set(), "rr": set()}
     for i in range(start_i, len(m15)):
         if i % 200 == 0:
@@ -978,35 +1016,42 @@ async def replay(d1, h4, m15, start_i, only=None):
         if side is None or (only and ((only == "buy") != (side == "up"))):
             continue
         st["bias"] += 1
-        if i <= busy:
+        free = [t for t in thresholds if i > busy[t]]
+        if not free:
             continue
         d1c = d1[max(0, kd - 150):kd]
         h4c = h4[max(0, kh - 300):kh]
         m15c = m15[max(0, i + 1 - 300):i + 1]
         h4f = partial_candle(m15, i, T, 14400)
-        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4), only)
+        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4), only, mode, lo_rr)
         rk = RANK.get(info.get("code"), -1)
         if rk >= RANK["no_crt"]:
             st["zone"] += 1
         if rk >= RANK["no_sweep"] and info.get("c1_t"):
             st["crt"].add(info["c1_t"])
-        if rk >= RANK["waiting_retrace"] and info.get("c1_t") and info.get("fvg_t"):
-            st["fvg"].add((info["c1_t"], info["fvg_t"]))
-        if info.get("code") == "rr_low" and info.get("c1_t") and info.get("fvg_t"):
-            st["rr"].add((info["c1_t"], info["fvg_t"]))
+        k2 = (info.get("c1_t"), info.get("fvg_t"))
+        if rk >= RANK["waiting_retrace"] and k2[0] and k2[1]:
+            st["fvg"].add(k2)
+        if info.get("code") in ("rr_low", "signal") and k2[0] and k2[1]:
+            rr_v = sig["rr"] if sig else info.get("rr")
+            if rr_v is None or rr_v < FUNNEL_RR:
+                st["rr"].add(k2)
         if not sig:
             continue
         k = (sig["side"], sig["c1_t"], sig["fvg_t"])
-        if k in seen:
-            continue
-        seen.add(k)
-        res, r, j = simulate(sig, m15, i)
-        trades.append({"side": sig["side"], "t": T, "res": res, "r": r, "rr": sig["rr"]})
-        busy = j
+        outcome = None
+        for thr in free:
+            if sig["rr"] >= thr and k not in seen[thr]:
+                seen[thr].add(k)
+                if outcome is None:
+                    outcome = simulate(sig, m15, i)
+                res, r, j = outcome
+                trades[thr].append({"side": sig["side"], "t": T, "res": res, "r": r, "rr": sig["rr"]})
+                busy[thr] = j
     return trades, st
 
 
-def summarize(sym, trades, st):
+def summarize(sym, trades):
     w = sum(1 for t in trades if t["res"] == "win")
     l = sum(1 for t in trades if t["res"] == "loss")
     to = sum(1 for t in trades if t["res"] == "timeout")
@@ -1015,10 +1060,22 @@ def summarize(sym, trades, st):
     buys = [t for t in trades if t["side"] == "buy" and t["res"] != "open"]
     sells = [t for t in trades if t["side"] == "sell" and t["res"] != "open"]
     return {"symbole": label(sym), "achats": len(buys), "r_achats": round(sum(t["r"] for t in buys), 2),
-            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades), "gagnes": w, "perdus": l,
-            "expires": to, "ouverts": op, "r_total": round(total_r, 2),
-            "steps": st["steps"], "bias": st["bias"], "zone": st["zone"],
-            "crt": len(st["crt"]), "fvg": len(st["fvg"]), "rr_rejetes": len(st["rr"])}
+            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades),
+            "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2)}
+
+
+def combo_total(trades, split_t):
+    closed = [t for t in trades if t["res"] != "open"]
+    old = [t for t in closed if t["t"] < split_t]
+    new = [t for t in closed if t["t"] >= split_t]
+    return {"setups": len(trades),
+            "gagnes": sum(1 for t in trades if t["res"] == "win"),
+            "perdus": sum(1 for t in trades if t["res"] == "loss"),
+            "expires": sum(1 for t in trades if t["res"] == "timeout"),
+            "ouverts": sum(1 for t in trades if t["res"] == "open"),
+            "r_total": round(sum(t["r"] for t in closed), 2),
+            "n_old": len(old), "r_old": round(sum(t["r"] for t in old), 2),
+            "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2)}
 
 
 async def hist_request(ws, payload):
@@ -1051,6 +1108,10 @@ async def fetch_history(ws, sym, gran, target, page):
     return sorted(got.values(), key=lambda c: c["t"])
 
 
+BT_MODES = ("fvg", "close")
+BT_THRS = (1.0, 1.5, 2.0)
+
+
 async def run_backtest():
     BT.update(running=True, done=False, error=None, results=None, progress="connexion à Deriv...")
     http = None
@@ -1058,36 +1119,51 @@ async def run_backtest():
     try:
         http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
         ws = await http.ws_connect(PUBLIC_WS, heartbeat=25)
-        rows = []
+        rows = {(m, t): [] for m in BT_MODES for t in BT_THRS}
+        alltr = {(m, t): [] for m in BT_MODES for t in BT_THRS}
+        funnel = {m: {"steps": 0, "bias": 0, "zone": 0, "crt": 0, "fvg": 0, "rr": 0} for m in BT_MODES}
+        split_t = 0
+        n_ok = 0
         for n, sym in enumerate(SYMBOLS):
             tag = "%d/%d %s" % (n + 1, len(SYMBOLS), sym)
             BT["progress"] = tag + " : téléchargement des bougies..."
+            err = None
             try:
                 d1 = await fetch_history(ws, real(sym), 86400, 400, 400)
                 h4 = await fetch_history(ws, real(sym), 14400, 1500, 1500)
                 m15 = await fetch_history(ws, real(sym), 900, (BT_DAYS + 4) * 96, 4000)
+                if len(m15) < 400:
+                    err = "pas assez d'historique (%d bougies M15)" % len(m15)
             except ApiError as e:
-                rows.append({"symbole": label(sym), "erreur": str(e)})
+                err = str(e)
+            if err:
+                for k in rows:
+                    rows[k].append({"symbole": label(sym), "erreur": err})
                 continue
-            if len(m15) < 400:
-                rows.append({"symbole": label(sym), "erreur": "pas assez d'historique (%d bougies M15)" % len(m15)})
-                continue
-            BT["progress"] = tag + " : analyse..."
+            n_ok += 1
+            split_t = max(split_t, m15[-1]["t"] - (BT_DAYS // 3) * 86400)
             start_t = m15[-1]["t"] - BT_DAYS * 86400
             start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
-            trades, st = await replay(d1, h4, m15, start_i, SIDE_ONLY.get(sym))
-            rows.append(summarize(sym, trades, st))
-        ok = [r for r in rows if "erreur" not in r]
-        total = {
-            "setups": sum(r["setups"] for r in ok), "gagnes": sum(r["gagnes"] for r in ok),
-            "perdus": sum(r["perdus"] for r in ok), "expires": sum(r["expires"] for r in ok),
-            "ouverts": sum(r["ouverts"] for r in ok), "r_total": round(sum(r["r_total"] for r in ok), 2),
-            "steps": sum(r["steps"] for r in ok), "bias": sum(r["bias"] for r in ok),
-            "zone": sum(r["zone"] for r in ok), "crt": sum(r["crt"] for r in ok),
-            "fvg": sum(r["fvg"] for r in ok), "rr_rejetes": sum(r["rr_rejetes"] for r in ok),
-            "marches": len(ok),
-        }
-        BT["results"] = {"jours": BT_DAYS, "lignes": rows, "total": total}
+            for mode in BT_MODES:
+                BT["progress"] = tag + " : analyse (" + mode + ")..."
+                trs, st = await replay(d1, h4, m15, start_i, SIDE_ONLY.get(sym), mode, BT_THRS)
+                for thr in BT_THRS:
+                    rows[(mode, thr)].append(summarize(sym, trs[thr]))
+                    alltr[(mode, thr)].extend(trs[thr])
+                f = funnel[mode]
+                f["steps"] += st["steps"]
+                f["bias"] += st["bias"]
+                f["zone"] += st["zone"]
+                f["crt"] += len(st["crt"])
+                f["fvg"] += len(st["fvg"])
+                f["rr"] += len(st["rr"])
+        combos = []
+        for mode in BT_MODES:
+            for thr in BT_THRS:
+                combos.append({"mode": mode, "min_rr": thr, "total": combo_total(alltr[(mode, thr)], split_t),
+                               "lignes": rows[(mode, thr)]})
+        BT["results"] = {"jours": BT_DAYS, "jours_new": BT_DAYS // 3, "marches": n_ok,
+                         "entonnoir": funnel, "combos": combos}
         BT["done"] = True
         BT["progress"] = "terminé"
     except asyncio.CancelledError:
