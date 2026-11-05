@@ -127,7 +127,7 @@ HTML_CONTENT = r"""
 
   <div class="card" id="btCard" style="display:none;">
     <h3>🧪 Test historique</h3>
-    <p class="small">Rejoue tes règles sur le passé, marché par marché, sans spread ni commission. Résultats en « R » : 1 R = ce que tu risques sur un trade (perdu = -1 R, gagné = +gain/risque).</p>
+    <p class="small">Rejoue tes règles sur le passé, marché par marché. Résultats en « R » : 1 R = ce que tu risques sur un trade (perdu = -1 R, gagné = +gain/risque). Les coûts réels (spread, glissement, commission) ne sont pas inclus.</p>
     <button class="btn btn-blue" id="btBtn" onclick="startBacktest()">Lancer le test</button>
     <div id="btStatus" class="small" style="margin-top:8px;"></div>
     <div id="btList" style="margin-top:8px;"></div>
@@ -313,7 +313,7 @@ async function loadBacktest() {
   const note = document.createElement("div");
   note.className = "small";
   note.style.marginTop = "6px";
-  note.textContent = "Rappel : sans spread ni commission. Moins de 100 trades par variante = on ne peut rien conclure.";
+  note.textContent = "Rappel : coûts réels (spread, glissement, commission) non inclus. Moins de 100 trades par variante = échantillon insuffisant.";
   list.appendChild(note);
 }
 
@@ -590,61 +590,91 @@ def pick_tp(entry, h4c, c1_high):
 
 
 def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None):
+    """Valide chronologiquement : sweep M15, réintégration clôturée, FVG puis retest."""
     min_rr = MIN_RR if min_rr is None else min_rr
-    win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
-    s = next((i for i, m in win if m["l"] < c1["l"]), None)
-    if s is None:
-        return {"code": "no_sweep", "c1_t": c1["t"]}
-    j = next((i for i in range(s + 1, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
-    if j is None:
-        return {"code": "no_reentry", "c1_t": c1["t"]}
     base = {"c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"]}
 
+    # allm ne contient ici que des M15 clôturées : aucune bougie future/en formation.
+    win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
+    sweep = next(((i, m) for i, m in win if m["l"] < c1["l"]), None)
+    if sweep is None:
+        return dict(base, code="no_sweep")
+
+    s, _ = sweep
+    # La réintégration doit clôturer strictement après la M15 du sweep.
+    j = next((i for i in range(s + 1, len(m15c))
+              if m15c[i]["c"] > c1["l"]), None)
+    if j is None:
+        return dict(base, code="no_reentry")
+
+    sweep_low = min(m["l"] for _, m in win if m["t"] <= m15c[j]["t"])
+
     if mode == "close":
-        # entrée au marché à la clôture de la 1re bougie M15 qui revient dans le range du CRT
+        # Le mode close ne signale qu'à la clôture de la toute première M15 de réintégration.
         if j != len(m15c) - 1:
-            return dict(base, code="no_fvg")
-        sweep_low = min(m["l"] for _, m in win if m["t"] <= m15c[j]["t"])
+            return dict(base, code="no_fvg", sweep_low=sweep_low)
         entry = m15c[j]["c"]
-        out = dict(base, fvg_bottom=entry, fvg_top=entry, fvg_t=m15c[j]["t"], sweep_low=sweep_low)
+        out = dict(base, fvg_bottom=entry, fvg_top=entry,
+                   fvg_t=m15c[j]["t"], sweep_low=sweep_low)
     else:
-        sweep_low = min(m["l"] for _, m in win)
+        # Le FVG doit se former après la clôture de réintégration.
         cands = []
-        for i in range(s, len(m15c) - 2):
+        for i in range(j, len(m15c) - 2):
             a, c = m15c[i], m15c[i + 2]
-            if i + 2 >= j and c["l"] > a["h"]:
+            if c["l"] > a["h"]:
                 bottom, top = a["h"], c["l"]
-                if all(m15c[k]["c"] >= bottom for k in range(i + 3, len(m15c))):
-                    cands.append((i, bottom, top))
-        if not cands:
-            return dict(base, code="no_fvg")
-        i, bottom, top = cands[-1]
-        price = allm[-1]["c"]
-        if price < bottom:
-            return dict(base, code="no_fvg")
-        out = dict(base, fvg_bottom=bottom, fvg_top=top, fvg_t=m15c[i]["t"], sweep_low=sweep_low)
-        touch = [k for k in range(i + 3, len(allm)) if allm[k]["l"] <= top]
-        if not touch or touch[-1] < len(allm) - 3:
-            out["code"] = "waiting_retrace"
-            return out
+                # Une clôture sous le bas invalide définitivement le FVG.
+                if any(m15c[k]["c"] < bottom for k in range(i + 3, len(m15c))):
+                    continue
+                cands.append((i, bottom, top))
+
+        # Un retest doit avoir lieu sur la DERNIÈRE M15 clôturée.
+        # Le prix doit atteindre le bord haut du FVG sans traverser son bord bas.
+        last = m15c[-1] if m15c else None
+        selected = None
+        if last is not None:
+            for i, bottom, top in reversed(cands):
+                touched_top = last["l"] <= top and last["h"] >= top
+                not_traversed = last["l"] >= bottom
+                closed_valid = last["c"] >= bottom
+                if touched_top and not_traversed and closed_valid:
+                    selected = (i, bottom, top)
+                    break
+
+        if selected is None:
+            if cands:
+                i, bottom, top = cands[-1]
+                return dict(base, code="waiting_retrace", fvg_bottom=bottom,
+                            fvg_top=top, fvg_t=m15c[i]["t"],
+                            sweep_low=sweep_low)
+            return dict(base, code="no_fvg", sweep_low=sweep_low)
+
+        i, bottom, top = selected
+        out = dict(base, fvg_bottom=bottom, fvg_top=top,
+                   fvg_t=m15c[i]["t"], sweep_low=sweep_low)
         entry = top
 
     if entry <= sweep_low:
         out["code"] = "rr_low"
         return out
+
     tp, label = pick_tp(entry, h4c, c1["h"])
-    if tp is None:
+    if tp is None or tp <= entry:
         out["code"] = "rr_low"
         return out
-    rr = (tp - entry) / (entry - sweep_low)
+
+    risk = entry - sweep_low
+    rr = (tp - entry) / risk if risk > 0 else 0.0
     out.update(entry=entry, sl=sweep_low, tp=tp, tp_label=label, rr=rr)
     out["code"] = "signal" if rr >= min_rr else "rr_low"
     return out
 
 
 def evaluate_buy(d1c, h4c, h4f, m15c, m15f, mode="fvg", min_rr=None):
-    allm = m15c + ([m15f] if m15f else [])
-    price = allm[-1]["c"]
+    # Les décisions de stratégie (zone, sweep, FVG et retest) utilisent
+    # exclusivement des M15 clôturées, comme dans le backtest.
+    allm = m15c
+    price = m15c[-1]["c"]
     rng = dealing_range_up(d1c, SWING_N)
     if not rng:
         return {"code": "no_range"}
@@ -971,7 +1001,13 @@ def simulate(sig, m15, i, max_bars=288):
     buy = sig["side"] == "buy"
     entry, sl, tp = sig["entry"], sig["sl"], sig["tp"]
     risk = abs(entry - sl)
+    if not m15 or risk <= 0 or i < 0 or i >= len(m15):
+        return "invalid", 0.0, i
     last_j = min(len(m15) - 1, i + max_bars)
+    # La M15 du signal sert à constater le retest/remplissage.
+    # Son high peut avoir été atteint AVANT le retour au FVG : on ne crédite donc
+    # jamais un TP sur cette même bougie. Le suivi commence à la M15 suivante.
+    # Sur les bougies suivantes, si SL et TP sont tous deux touchés, SL est prioritaire.
     for j in range(i + 1, last_j + 1):
         c = m15[j]
         hit_sl = (c["l"] <= sl) if buy else (c["h"] >= sl)
