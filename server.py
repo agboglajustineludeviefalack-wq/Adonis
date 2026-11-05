@@ -58,9 +58,9 @@ MT5 = {
 SIDE_ONLY = {"BOOM500": "buy", "BOOM1000": "buy", "CRASH500": "sell", "CRASH1000": "sell"}
 RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
 NAMES = {}      # code Deriv -> nom affiché par Deriv
-ENTRY_MODE = os.environ.get("ENTRY_MODE", "fvg").lower()  # "fvg" = retest FVG confirmé, entrée à la clôture M15 ; "close" = clôture de réintégration
+ENTRY_MODE = os.environ.get("ENTRY_MODE", "close").lower()  # stratégie principale : entrée à la clôture M15 de réintégration
 if ENTRY_MODE not in ("fvg", "close"):
-    ENTRY_MODE = "fvg"
+    ENTRY_MODE = "close"
 PD_RANGE = os.environ.get("PD_RANGE", "H4").upper()    # range du discount/premium : H4 ou D1
 SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté d'un sommet/creux
 MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
