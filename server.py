@@ -58,7 +58,7 @@ MT5 = {
 SIDE_ONLY = {"BOOM500": "buy", "BOOM1000": "buy", "CRASH500": "sell", "CRASH1000": "sell"}
 RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
 NAMES = {}      # code Deriv -> nom affiché par Deriv
-ENTRY_MODE = os.environ.get("ENTRY_MODE", "fvg").lower()  # "fvg" = retour sur le FVG, "close" = à la clôture du retour dans le range
+ENTRY_MODE = os.environ.get("ENTRY_MODE", "fvg").lower()  # "fvg" = retest FVG confirmé, entrée à la clôture M15 ; "close" = clôture de réintégration
 if ENTRY_MODE not in ("fvg", "close"):
     ENTRY_MODE = "fvg"
 PD_RANGE = os.environ.get("PD_RANGE", "H4").upper()    # range du discount/premium : H4 ou D1
@@ -264,7 +264,7 @@ async function startBacktest() {
 }
 
 const MODE_NAMES = {
-  fvg: "Entrée sur retour au FVG",
+  fvg: "Retest FVG confirmé — entrée à la clôture M15",
   close: "Entrée à la clôture du retour dans le range"
 };
 const sign = x => (Number(x) >= 0 ? "+" : "") + x;
@@ -619,7 +619,10 @@ def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None):
     else:
         # Le FVG doit se former après la clôture de réintégration.
         cands = []
-        for i in range(j, len(m15c) - 2):
+        # Il faut au minimum une bougie M15 supplémentaire APRÈS la
+        # troisième bougie du FVG : cette bougie distincte seule peut retester.
+        # range(..., len - 3) garantit i + 2 < len(m15c) - 1.
+        for i in range(j, len(m15c) - 3):
             a, c = m15c[i], m15c[i + 2]
             if c["l"] > a["h"]:
                 bottom, top = a["h"], c["l"]
@@ -630,6 +633,8 @@ def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None):
 
         # Un retest doit avoir lieu sur la DERNIÈRE M15 clôturée.
         # Le prix doit atteindre le bord haut du FVG sans traverser son bord bas.
+        # Le signal n'est confirmé qu'à la clôture de cette M15 : l'entrée
+        # exécutable est donc son cours de clôture, pas le bord théorique du FVG.
         last = m15c[-1] if m15c else None
         selected = None
         if last is not None:
@@ -651,8 +656,9 @@ def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None):
 
         i, bottom, top = selected
         out = dict(base, fvg_bottom=bottom, fvg_top=top,
-                   fvg_t=m15c[i]["t"], sweep_low=sweep_low)
-        entry = top
+                   fvg_t=m15c[i]["t"], sweep_low=sweep_low,
+                   retest_t=last["t"], retest_close=last["c"])
+        entry = last["c"]
 
     if entry <= sweep_low:
         out["code"] = "rr_low"
@@ -771,7 +777,7 @@ def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, m
         "no_sweep": "CRT H4 vu, sweep pas encore visible en M15",
         "no_reentry": "sweep fait, pas encore de clôture M15 dans le range",
         "no_fvg": ("retour dans le range, pas de FVG M15 valide" if mode == "fvg" else "retour dans le range déjà passé (l'entrée se fait à la clôture de cette bougie)"),
-        "waiting_retrace": "FVG M15 repéré, attente du retour du prix dessus",
+        "waiting_retrace": "FVG M15 repéré, attente d'une bougie de retest clôturée",
         "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
         "signal": "SETUP A+",
     }
@@ -790,9 +796,10 @@ def build_text(sym, sig):
         "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", label(sym)),
         "Biais H4 %s (Daily pas contre), prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
         "CRT H4 : sweep puis retour dans le range",
-        ("Entrée au marché, à la clôture de la bougie M15 de retour dans le range" if sig["fvg_bottom"] == sig["fvg_top"]
-         else "Zone FVG M15 : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"]))),
-        "Entrée repère : %s" % fmt(sig["entry"]),
+        ("Entrée au marché, à la clôture M15 de réintégration" if sig["fvg_bottom"] == sig["fvg_top"]
+         else "FVG M15 retesté : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"]))),
+        ("Entrée au marché à la clôture de la bougie M15 de retest : %s" % fmt(sig["entry"])
+         if sig["fvg_bottom"] != sig["fvg_top"] else "Entrée repère : %s" % fmt(sig["entry"])),
         "Stop : %s (distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
         "TP : %s (%s, soit %.2f%% du prix)" % (fmt(sig["tp"]), sig["tp_label"], abs(sig["tp"] - sig["entry"]) / abs(sig["entry"]) * 100),
         "Gain/risque : %.1f pour 1" % sig["rr"],
@@ -1004,9 +1011,9 @@ def simulate(sig, m15, i, max_bars=288):
     if not m15 or risk <= 0 or i < 0 or i >= len(m15):
         return "invalid", 0.0, i
     last_j = min(len(m15) - 1, i + max_bars)
-    # La M15 du signal sert à constater le retest/remplissage.
-    # Son high peut avoir été atteint AVANT le retour au FVG : on ne crédite donc
-    # jamais un TP sur cette même bougie. Le suivi commence à la M15 suivante.
+    # L'entrée est au cours de clôture de la M15 du signal (confirmation du retest).
+    # Le suivi du trade commence à la M15 suivante : aucun TP/SL antérieur
+    # à l'instant d'entrée n'est donc crédité.
     # Sur les bougies suivantes, si SL et TP sont tous deux touchés, SL est prioritaire.
     for j in range(i + 1, last_j + 1):
         c = m15[j]
