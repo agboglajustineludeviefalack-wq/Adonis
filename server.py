@@ -967,3 +967,180 @@ def build_text(sym, sig):
         "Aucun ordre n'est passé : vérifie sur le graphique.",
     ])
 
+# ==================================================================
+#  SCANNER (récupère les bougies et envoie les alertes)
+# ==================================================================
+class ApiError(Exception):
+    pass
+
+
+_REQ = 0
+
+
+async def ws_request(ws, payload, timeout=15):
+    global _REQ
+    _REQ += 1
+    rid = _REQ
+    await ws.send_str(json.dumps(dict(payload, req_id=rid)))
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError("pas de réponse de Deriv")
+        msg = await ws.receive(timeout=remaining)
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data)
+            except ValueError:
+                continue
+            if data.get("req_id") == rid:
+                if data.get("error"):
+                    raise ApiError(str(data["error"].get("message", data["error"]))[:150])
+                return data
+        elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                          aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            raise ConnectionError("WebSocket fermé par Deriv")
+
+
+def norm_candles(raw):
+    out = []
+    for c in raw or []:
+        try:
+            out.append({"t": int(c["epoch"]), "o": float(c["open"]), "h": float(c["high"]),
+                        "l": float(c["low"]), "c": float(c["close"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
+async def fetch_candles(ws, sym, gran, count):
+    data = await ws_request(ws, {
+        "ticks_history": sym, "end": "latest", "style": "candles",
+        "granularity": gran, "count": count,
+    })
+    return norm_candles(data.get("candles"))
+
+
+async def load_symbols(ws):
+    try:
+        data = await ws_request(ws, {"active_symbols": "brief"})
+    except (ApiError, asyncio.TimeoutError) as e:
+        print("active_symbols refusé :", repr(e))
+        return
+    items = []
+    for s in data.get("active_symbols") or []:
+        sid = s.get("underlying_symbol") or s.get("symbol")
+        if sid:
+            items.append([sid, s.get("underlying_symbol_name") or s.get("display_name") or sid])
+    items.sort(key=lambda x: x[1])
+    STATE["available"] = items
+    ids = set(x[0] for x in items)
+    for i_, n_ in items:
+        NAMES[i_] = n_
+    for sym in SYMBOLS:
+        if items and sym not in ids:
+            hint = HINTS.get(sym, "").lower()
+            match = next((i_ for i_, n_ in items if hint and (hint in n_.lower() or hint in i_.lower())), None)
+            if match:
+                RESOLVED[sym] = match
+                print("Marché %s retrouvé par mot-clé : %s" % (sym, match))
+            else:
+                print("ATTENTION : symbole inconnu chez Deriv :", sym)
+
+
+async def send_ntfy(title, text):
+    if not NTFY_TOPIC:
+        return
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.post(
+                "https://ntfy.sh/" + NTFY_TOPIC,
+                data=text.encode("utf-8"),
+                headers={"Title": title, "Priority": "high", "Tags": "chart_with_upwards_trend"},
+            ) as r:
+                if r.status >= 300:
+                    print("ntfy a répondu", r.status)
+    except Exception as e:
+        print("Erreur ntfy :", repr(e))
+
+
+async def handle_signal(sym, sig):
+    key = (sym, sig["side"], sig["c1_t"], sig["fvg_t"])
+    if key in SENT:
+        return
+    if len(SENT) > 500:
+        SENT.clear()
+    SENT.add(key)
+    text = build_text(sym, sig)
+    SIGNALS.append({"heure": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", "texte": text})
+    print("SIGNAL", sym, sig["side"])
+    await send_ntfy("Setup %s %s %s" % (sig.get("grade", "B"), label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
+
+
+def stale(fetched, now, ttl, gran):
+    return now - fetched > ttl or int(now // gran) != int(fetched // gran)
+
+
+async def scan_once(ws, cache):
+    for sym in SYMBOLS:
+        try:
+            now = time.time()
+            ck, hk = (sym, 86400), (sym, 14400)
+            if ck not in cache or stale(cache[ck][0], now, 900, 86400):
+                cache[ck] = (now, await fetch_candles(ws, real(sym), 86400, 150))
+            if hk not in cache or stale(cache[hk][0], now, H4_TTL, 14400):
+                cache[hk] = (now, await fetch_candles(ws, real(sym), 14400, 300))
+            m15 = await fetch_candles(ws, real(sym), 900, 300)
+            info, sig = analyze(sym, cache[ck][1], cache[hk][1], m15, time.time())
+        except ApiError as e:
+            if "rate" in str(e).lower():
+                STATE["error"] = "limite de requêtes Deriv atteinte, nouvel essai au prochain tour"
+                return
+            info, sig = {"resume": "erreur Deriv : %s" % e}, None
+        info["label"] = label(sym)
+        info["nom"] = NAMES.get(real(sym), "")
+        STATE["symbols"][sym] = info
+        if sig:
+            await handle_signal(sym, sig)
+        await asyncio.sleep(0.3)
+    STATE["last"] = time.time()
+
+
+async def scanner_loop():
+    await asyncio.sleep(3)
+    if _raw_topic and not NTFY_TOPIC:
+        print("NTFY_TOPIC invalide : 8 à 64 caractères, lettres, chiffres, - ou _ seulement.")
+    print("Scanner : marchés =", SYMBOLS, "| ntfy actif :", bool(NTFY_TOPIC))
+    http = None
+    ws = None
+    cache = {}
+    first_ok = True
+    while True:
+        try:
+            if ws is None or ws.closed:
+                if http is None or http.closed:
+                    http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
+                ws = await http.ws_connect(PUBLIC_WS, heartbeat=25)
+                print("Scanner : connecté au flux public Deriv")
+                await load_symbols(ws)
+            await scan_once(ws, cache)
+            STATE["error"] = None
+            if first_ok:
+                first_ok = False
+                await send_ntfy("Scanner demarre", "Le scanner Adonis tourne sur le serveur. Les alertes arriveront ici.")
+        except asyncio.CancelledError:
+            if http is not None:
+                await http.close()
+            raise
+        except Exception as e:
+            STATE["error"] = (type(e).__name__ + ": " + str(e))[:200]
+            print("Scanner erreur :", repr(e))
+            try:
+                if ws is not None:
+                    await ws.close()
+            except Exception:
+                pass
+            ws = None
+        await asyncio.sleep(SCAN_EVERY)
+
