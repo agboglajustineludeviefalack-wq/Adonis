@@ -502,3 +502,468 @@ window.onload = init;
 </body>
 </html>
 """
+# ==================================================================
+#  ANALYSE (CRT H4 + biais Daily/H4 + discount/premium + FVG M15)
+#  Les fonctions ci-dessous ne font aucun appel réseau.
+#  Chaque bougie = {"t": début en secondes, "o", "h", "l", "c"}
+#  Pour les VENTES, on inverse les prix (miroir) et on réutilise
+#  exactement la logique des ACHATS, puis on remet les prix à l'endroit.
+# ==================================================================
+RANK = {
+    "no_range": 0, "not_in_zone": 1, "no_crt": 2, "no_sweep": 3,
+    "no_reentry": 4, "no_fvg": 5, "waiting_retrace": 6, "rr_low": 7, "signal": 8,
+
+    "fvg_invalidated": 5,
+}
+ARROW = {"up": "↑", "down": "↓", None: "?"}
+
+# Profils historiques issus du backtest CRT clôture M15 (180 jours, RR >= 2).
+# Une donnée absente n'est PAS considérée comme une preuve de rentabilité.
+# USDJPY est le seul marché clairement défavorable dans les résultats communiqués :
+# les achats comme les ventes sont négatifs, et les ventes RR>=2 ont fait 6 pertes/6.
+# Les autres marchés restent à confirmer par un échantillon directionnel suffisant.
+MARKET_HISTORY = {
+    "frxUSDJPY": {"buy": {"status": "weak", "note": "historique négatif dans les trois seuils RR testés"},
+                  "sell": {"status": "weak", "note": "6 ventes RR>=2, 6 pertes (-6R) ; historique négatif"}},
+}
+HISTORY_MIN_TRADES = 20
+HISTORY_MIN_PF = 1.25
+HISTORY_MIN_EXPECTANCY = 0.15
+
+
+def classify_setup(sym, sig):
+    """Classe le signal sans confondre qualité technique et preuve statistique."""
+    side = sig["side"]
+    rr = float(sig.get("rr", 0.0) or 0.0)
+    hist = MARKET_HISTORY.get(sym, {}).get(side)
+
+    # Qualité technique : le CRT, le sweep et la clôture M15 de réintégration
+    # sont déjà obligatoires pour qu'un signal soit produit. Le RR départage ici.
+    if rr < 2.0:
+        technical = "B"
+    elif rr >= 3.5:
+        technical = "A+"
+    else:
+        technical = "A"
+
+    # A+ exige en plus un historique directionnel robuste, pas seulement un beau RR.
+    if hist and hist.get("status") == "weak":
+        return "B", "marché/sens historiquement défavorable : " + hist.get("note", "prudence")
+
+    if hist and hist.get("status") == "validated":
+        n = int(hist.get("n", 0))
+        pf = hist.get("pf")
+        expectancy = hist.get("expectancy", 0.0)
+        if (n >= HISTORY_MIN_TRADES and pf is not None and pf >= HISTORY_MIN_PF
+                and expectancy >= HISTORY_MIN_EXPECTANCY and technical == "A+"):
+            return "A+", "historique directionnel validé (%d trades, PF %s, espérance %sR)" % (
+                n, pf, expectancy)
+
+    if technical == "B":
+        return "B", "qualité technique insuffisante"
+    if hist and hist.get("status") == "promising":
+        return "A", "historique prometteur mais échantillon trop faible pour A+"
+    return "A", "technique propre, mais historique directionnel pas encore validé pour A+"
+
+
+def refresh_market_history(alltr):
+    """Actualise les profils directionnels depuis le backtest CRT clôture RR>=2."""
+    global MARKET_HISTORY
+    trades = alltr.get(("fvg", 2.0), [])
+    refreshed = dict(MARKET_HISTORY)
+    symbols = sorted({t.get("sym") for t in trades if t.get("sym")})
+    for sym in symbols:
+        per_side = dict(refreshed.get(sym, {}))
+        for side in ("buy", "sell"):
+            group = [t for t in trades if t.get("sym") == sym and t.get("side") == side
+                     and t.get("res") != "open"]
+            if not group:
+                continue
+            stats = performance_stats(group)
+            n = stats["n_clos"]
+            # Ne remplace pas un avertissement historique documenté par un
+            # échantillon trop petit du backtest courant.
+            if n < 8:
+                continue
+            pf = stats["profit_factor"]
+            expectancy = stats["expectancy_r"]
+            numeric_pf = pf if isinstance(pf, (int, float)) else (float("inf") if pf == "inf" else None)
+            if (n >= HISTORY_MIN_TRADES and numeric_pf is not None
+                    and numeric_pf >= HISTORY_MIN_PF
+                    and expectancy >= HISTORY_MIN_EXPECTANCY):
+                status = "validated"
+            elif n >= 8 and ((numeric_pf is not None and numeric_pf < 1.0) or expectancy < 0):
+                status = "weak"
+            elif n >= 8 and expectancy > 0 and numeric_pf is not None and numeric_pf > 1.0:
+                status = "promising"
+            else:
+                status = "insufficient"
+            per_side[side] = {"status": status, "n": n, "pf": pf,
+                              "expectancy": expectancy,
+                              "note": "backtest CRT clôture RR>=2 actualisé"}
+        refreshed[sym] = per_side
+    MARKET_HISTORY = refreshed
+
+
+def real(sym):
+    return RESOLVED.get(sym, sym)
+
+
+def label(sym):
+    return MT5.get(sym, sym)
+
+
+def pick_side(b_d1, b_h4):
+    """Le H4 décide. Le Daily n'a qu'un droit de veto : il interdit seulement un trade contre lui."""
+    if b_h4 is None:
+        return None
+    if b_d1 is not None and b_d1 != b_h4:
+        return None
+    return b_h4
+
+
+def side_allowed(only, side):
+    """Applique la restriction directionnelle identique au scanner et au backtest."""
+    return not only or ((only == "buy") == (side == "up"))
+
+
+def fmt(x):
+    return ("%.2f" % x) if abs(x) >= 100 else ("%.5f" % x)
+
+
+def split_closed(cs, gran, now):
+    closed = [c for c in cs if c["t"] + gran <= now]
+    forming = [c for c in cs if c["t"] + gran > now]
+    return closed, (forming[-1] if forming else None)
+
+
+def mirror(cs):
+    return [{"t": c["t"], "o": -c["o"], "h": -c["l"], "l": -c["h"], "c": -c["c"]} for c in cs]
+
+
+def mirror_one(c):
+    return None if c is None else mirror([c])[0]
+
+
+def swings(cs, n):
+    highs, lows = [], []
+    for i in range(n, len(cs) - n):
+        h, l = cs[i]["h"], cs[i]["l"]
+        if all(h > cs[i - k]["h"] for k in range(1, n + 1)) and all(h >= cs[i + k]["h"] for k in range(1, n + 1)):
+            highs.append((i, h))
+        if all(l < cs[i - k]["l"] for k in range(1, n + 1)) and all(l <= cs[i + k]["l"] for k in range(1, n + 1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def structure_bias(cs, n):
+    hs, ls = swings(cs, n)
+    if len(hs) < 2 or len(ls) < 2:
+        return None
+    if hs[-1][1] > hs[-2][1] and ls[-1][1] > ls[-2][1]:
+        return "up"
+    if hs[-1][1] < hs[-2][1] and ls[-1][1] < ls[-2][1]:
+        return "down"
+    return None
+
+
+def dealing_range_up(cs, n):
+    """Dernier grand mouvement haussier : du dernier creux au dernier sommet confirmés."""
+    hs, ls = swings(cs, n)
+    if not hs:
+        return None
+    hi_i, hi = hs[-1]
+    before = [v for i, v in ls if i < hi_i]
+    if not before:
+        return None
+    lo = before[-1]
+    if hi <= lo:
+        return None
+    return lo, hi
+
+
+def _dealing_range_snapshot(candles, price, n=2):
+    """Dernier swing high au-dessus et swing low sous le prix, tous deux confirmés."""
+    hs, ls = swings(candles, n)
+    highs = [v for _, v in hs if v > price]
+    lows = [v for _, v in ls if v < price]
+    if not highs or not lows:
+        return None
+    lo, hi = lows[-1], highs[-1]
+    return (lo, hi) if lo < price < hi else None
+
+
+def pick_tp(entry, h4c, c1_high, d1c=None, setup_price=None):
+    """Cible H4 par parcours des pools, sans priorité fixe de famille.
+    Si aucun dealing range H4 ne peut encadrer le prix au setup, CRT opposé seul.
+    """
+    setup_price = entry if setup_price is None else setup_price
+    dr = _dealing_range_snapshot(h4c[-300:], setup_price, SWING_N)
+    if dr is None:
+        return (c1_high, "haut du CRT (fallback sans dealing range H4)") if c1_high > entry else (None, None)
+    hs, _ = swings(h4c[-300:], SWING_N)
+    pools = [(h, "swing H4") for _, h in hs if h > entry]
+    if h4c:
+        prev_h4 = h4c[-1]["h"]
+        if prev_h4 > entry:
+            pools.append((prev_h4, "previous H4"))
+    if d1c:
+        pdh = d1c[-1]["h"]
+        if pdh > entry:
+            pools.append((pdh, "PDH"))
+    if c1_high > entry:
+        pools.append((c1_high, "haut du CRT"))
+    if not pools:
+        return None, None
+    # Déduplication des pools proches; les familles fusionnées sont journalisées.
+    pools.sort(key=lambda x: x[0])
+    merged = []
+    for price, label_ in pools:
+        near = next((g for g in merged if abs(g[0]-price) <= max(abs(price)*EQ_TOL, 1e-12)), None)
+        if near:
+            near[1].add(label_)
+        else:
+            merged.append([price, {label_}])
+    target = merged[0]
+    return target[0], "+".join(sorted(target[1]))
+
+
+def _atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for k in range(-period, 0):
+        c, p = candles[k], candles[k - 1]
+        trs.append(max(c["h"] - c["l"], abs(c["h"] - p["c"]), abs(c["l"] - p["c"])))
+    return sum(trs) / len(trs) if trs else None
+
+
+def _v6_buffer(candles):
+    if V6_BUFFER_MODE == "fixed":
+        return max(0.0, V6_FIXED_BUFFER)
+    a = _atr(candles, max(2, V6_ATR_PERIOD))
+    return max(0.0, (a or 0.0) * max(0.0, V6_ATR_MULT))
+
+
+def find_entry(c1, c2, m15c, allm, h4c, mode="fvg", min_rr=None, d1c=None):
+    """V6: premier FVG post-réintégration verrouillé; retest strict et SL derrière FVG."""
+    min_rr = MIN_RR if min_rr is None else min_rr
+    base = {"c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"]}
+    win = [(i, m) for i, m in enumerate(allm) if m["t"] >= c2["t"]]
+    sweep = next(((i, m) for i, m in win if m["l"] < c1["l"]), None)
+    if sweep is None:
+        return dict(base, code="no_sweep")
+    s, sweep_candle = sweep
+    j = next((i for i in range(s + 1, len(m15c)) if m15c[i]["c"] > c1["l"]), None)
+    if j is None:
+        return dict(base, code="no_reentry")
+    sweep_low = min(m["l"] for _, m in win if m["t"] <= m15c[j]["t"])
+
+    if mode == "close":
+        # V6 n'autorise plus l'ancien mode close: le FVG confirmé est obligatoire.
+        return dict(base, code="no_fvg", sweep_low=sweep_low)
+
+    # Premier FVG haussier formé après la clôture de réintégration.
+    # Le FVG n'est exploitable qu'après clôture de sa troisième bougie.
+    locked = None
+    for k in range(j + 1, len(m15c) - 2):
+        a, third = m15c[k], m15c[k + 2]
+        if third["l"] > a["h"]:
+            locked = (k, a["h"], third["l"], k + 2)
+            break
+    if locked is None:
+        return dict(base, code="no_fvg", sweep_low=sweep_low)
+    k, bottom, top, confirmed = locked
+
+    # L'invalidation du FVG initial annule définitivement ce setup H4.
+    # On ne remplace jamais le FVG verrouillé par un FVG ultérieur.
+    for q in range(confirmed + 1, len(m15c)):
+        candle = m15c[q]
+        if candle["c"] < bottom:
+            return dict(base, code="fvg_invalidated", fvg_bottom=bottom, fvg_top=top,
+                        fvg_t=m15c[k]["t"], sweep_low=sweep_low)
+
+    last = m15c[-1]
+    # Le retest doit réellement pénétrer la zone et clôturer strictement au-dessus
+    # du bord proche (top pour un FVG haussier). Une égalité ne valide pas.
+    retest_found = None
+    for q in range(confirmed + 1, len(m15c)):
+        c = m15c[q]
+        intersects = c["l"] <= top and c["h"] >= bottom
+        penetrates = c["l"] < top
+        if intersects and penetrates and c["c"] > top:
+            retest_found = (q, c)
+    if retest_found is None or retest_found[0] != len(m15c) - 1:
+        return dict(base, code="waiting_retrace", fvg_bottom=bottom, fvg_top=top,
+                    fvg_t=m15c[k]["t"], sweep_low=sweep_low)
+
+    entry = last["c"]
+    buffer = _v6_buffer(m15c[max(0, len(m15c)-V6_ATR_PERIOD-2):])
+    sl = bottom - buffer
+    if entry <= sl:
+        return dict(base, code="rr_low", fvg_bottom=bottom, fvg_top=top, sweep_low=sweep_low)
+    setup_h4 = [x for x in h4c if x["t"] <= c2["t"]]
+    setup_d1 = [x for x in (d1c or []) if x["t"] + 86400 <= c2["t"] + 14400]
+    tp, label = pick_tp(entry, setup_h4, c1["h"], setup_d1, setup_price=c2["c"])
+    h4_dr = _dealing_range_snapshot(setup_h4[-300:], c2["c"], SWING_N)
+    if tp is None or tp <= entry:
+        return dict(base, code="rr_low", fvg_bottom=bottom, fvg_top=top, sweep_low=sweep_low)
+    risk = entry - sl
+    rr = (tp - entry) / risk if risk > 0 else 0.0
+    out = dict(base, fvg_bottom=bottom, fvg_top=top, fvg_t=m15c[k]["t"],
+               sweep_low=sweep_low, sweep_t=sweep_candle["t"], reentry_t=m15c[j]["t"],
+               reentry_o=m15c[j]["o"], reentry_h=m15c[j]["h"], reentry_l=m15c[j]["l"],
+               reentry_c=m15c[j]["c"], retest_t=last["t"], retest_close=last["c"],
+               entry=entry, sl=sl, tp=tp, tp_label=label, rr=rr,
+               fvg_buffer=buffer,
+               h4_dr_low=(h4_dr[0] if h4_dr else None), h4_dr_high=(h4_dr[1] if h4_dr else None),
+               code="signal" if rr >= min_rr else "rr_low")
+    return out
+
+
+def evaluate_buy(d1c, h4c, h4f, m15c, m15f, mode="fvg", min_rr=None, d1_ref=None):
+    # Les décisions de stratégie (zone, sweep, FVG et retest) utilisent
+    # exclusivement des M15 clôturées, comme dans le backtest.
+    allm = m15c
+    price = m15c[-1]["c"]
+    rng = dealing_range_up(d1c, SWING_N)
+    if not rng:
+        return {"code": "no_range"}
+    lo, hi = rng
+    eq = (lo + hi) / 2.0
+    base = {"price": price, "range_lo": lo, "range_hi": hi, "eq": eq}
+    if not (lo <= price < eq):
+        return dict(base, code="not_in_zone")
+
+    pairs = []
+    if h4f is not None and h4c:
+        pairs.append((h4c[-1], h4f, False))   # la bougie 2 est en cours
+    if len(h4c) >= 2:
+        pairs.append((h4c[-2], h4c[-1], True))  # la bougie 2 vient de se fermer
+    best = dict(base, code="no_crt")
+    for c1, c2, closed in pairs:
+        if not (c2["l"] < c1["l"]) or c2["h"] > c1["h"]:
+            continue  # pas de sweep du bas, ou les deux côtés balayés
+        if closed and not (c1["l"] < c2["c"] <= c1["h"]):
+            continue  # la bougie 2 n'a pas clôturé dans le range
+        res = dict(base, **find_entry(c1, c2, m15c, allm, h4c, mode, min_rr, d1_ref))
+        if RANK[res["code"]] > RANK[best["code"]]:
+            best = res
+    return best
+
+
+def unmirror(m):
+    out = dict(m)
+    if "price" in m:
+        out["price"] = -m["price"]
+    if "eq" in m:
+        out["eq"] = -m["eq"]
+    if "range_lo" in m:
+        out["range_lo"], out["range_hi"] = -m["range_hi"], -m["range_lo"]
+    if "fvg_bottom" in m:
+        out["fvg_bottom"], out["fvg_top"] = -m["fvg_top"], -m["fvg_bottom"]
+    if "c1_high" in m:
+        out["c1_low"], out["c1_high"] = -m["c1_high"], -m["c1_low"]
+    for k in ("entry", "sl", "tp", "sweep_low"):
+        if k in m:
+            out[k] = -m[k]
+    if all(k in m for k in ("reentry_o", "reentry_h", "reentry_l", "reentry_c")):
+        out["reentry_o"] = -m["reentry_o"]
+        out["reentry_h"] = -m["reentry_l"]
+        out["reentry_l"] = -m["reentry_h"]
+        out["reentry_c"] = -m["reentry_c"]
+    labels = {"Equal Highs": "Equal Lows", "haut du CRT": "bas du CRT", "sommet H4": "creux H4"}
+    if "tp_label" in m:
+        out["tp_label"] = labels.get(m["tp_label"], m["tp_label"])
+    return out
+
+
+def analyze(sym, d1, h4, m15, now):
+    """Version en direct : sépare les bougies fermées / en cours, puis analyse."""
+    if m15 and now - (m15[-1]["t"] + 900) > 1800:
+        return {"resume": "marché fermé ou données anciennes"}, None
+    d1c, _ = split_closed(d1, 86400, now)
+    h4c, h4f = split_closed(h4, 14400, now)
+    m15c, m15f = split_closed(m15, 900, now)
+    info, sig = analyze_core(d1c, h4c, h4f, m15c, m15f, None, SIDE_ONLY.get(sym))
+    if sig:
+        grade, reason = classify_setup(sym, sig)
+        sig["grade"] = grade
+        sig["grade_reason"] = reason
+        info["grade"] = grade
+        info["grade_reason"] = reason
+        info["resume"] = info["resume"].replace("SETUP À CLASSER", "SETUP " + grade)
+    return info, sig
+
+
+def analyze_core(d1c, h4c, h4f, m15c, m15f, biases=None, only=None, mode=None, min_rr=None):
+    """Retourne (infos_pour_la_page, signal_ou_None)."""
+    mode = mode or ENTRY_MODE
+    if len(d1c) < 15 or len(h4c) < 15 or len(m15c) < 15:
+        return {"resume": "pas assez de bougies reçues (D1 %d, H4 %d, M15 %d)" % (len(d1c), len(h4c), len(m15c))}, None
+
+    if biases:
+        b_d1, b_h4 = biases
+    else:
+        b_d1, b_h4 = structure_bias(d1c, SWING_N), structure_bias(h4c, SWING_N)
+    head = "D1 %s · H4 %s" % (ARROW[b_d1], ARROW[b_h4])
+    px = " · prix " + fmt((m15f or m15c[-1])["c"])
+    side = pick_side(b_d1, b_h4)
+    if side is None:
+        why = "H4 sans structure claire" if b_h4 is None else "Daily contre le H4"
+        return {"resume": head + " · " + why + ", pas de trade" + px}, None
+
+    if not side_allowed(only, side):
+        return {"resume": head + " · ici on ne trade que les %s (spikes), mais le H4 est %s : pas de trade%s" % (
+            "achats" if only == "buy" else "ventes", "haussier" if side == "up" else "baissier", px)}, None
+
+    buy = (side == "up")
+    zone = "discount" if buy else "premium"
+    rng_src = d1c if PD_RANGE == "D1" else h4c
+    if buy:
+        res = evaluate_buy(rng_src, h4c, h4f, m15c, m15f, mode, min_rr, d1c)
+    else:
+        res = unmirror(evaluate_buy(mirror(rng_src), mirror(h4c), mirror_one(h4f), mirror(m15c), mirror_one(m15f), mode, min_rr, mirror(d1c)))
+
+    code = res["code"]
+    if RANK[code] >= RANK["no_crt"]:
+        head += " · en " + zone
+    msgs = {
+        "no_range": "range %s introuvable" % PD_RANGE,
+        "not_in_zone": "prix pas en %s (prix %s, équilibre %s)" % (zone, fmt(res.get("price", 0)), fmt(res.get("eq", 0))),
+        "no_crt": "pas de CRT H4 en cours",
+        "no_sweep": "CRT H4 vu, sweep pas encore visible en M15",
+        "no_reentry": "sweep fait, pas encore de clôture M15 dans le range",
+        "fvg_invalidated": "premier FVG M15 invalidé : setup H4 annulé, aucun remplacement",
+        "no_fvg": ("retour dans le range, pas de FVG M15 valide" if mode == "fvg" else "retour dans le range déjà passé (l'entrée se fait à la clôture de cette bougie)"),
+        "waiting_retrace": "FVG M15 repéré, attente d'une bougie de retest clôturée",
+        "rr_low": "setup trouvé mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
+        "signal": "SETUP À CLASSER",
+    }
+    info = {"resume": head + " · " + msgs[code] + px, "code": code,
+            "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t"), "rr": res.get("rr")}
+    if code == "signal":
+        sig = dict(res)
+        sig["side"] = "buy" if buy else "sell"
+        return info, sig
+    return info, None
+
+
+def build_text(sym, sig):
+    buy = sig["side"] == "buy"
+    return "\n".join([
+        "%s %s - Setup %s" % ("ACHAT" if buy else "VENTE", label(sym), sig.get("grade", "B")),
+        "Classement : %s" % sig.get("grade_reason", "historique directionnel non validé"),
+        "Biais H4 %s (Daily pas contre), prix en %s" % ("haussier" if buy else "baissier", "discount" if buy else "premium"),
+        "CRT H4 : sweep puis retour dans le range",
+        ("Entrée au marché, à la clôture M15 de réintégration" if sig["fvg_bottom"] == sig["fvg_top"]
+         else "FVG M15 retesté : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"]))),
+        ("Entrée au marché à la clôture de la bougie M15 de retest : %s" % fmt(sig["entry"])
+         if sig["fvg_bottom"] != sig["fvg_top"] else "Entrée repère : %s" % fmt(sig["entry"])),
+        "Stop : %s (derrière le FVG initial + buffer, distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
+        "TP : %s (%s, soit %.2f%% du prix)" % (fmt(sig["tp"]), sig["tp_label"], abs(sig["tp"] - sig["entry"]) / abs(sig["entry"]) * 100),
+        "Gain/risque : %.1f pour 1" % sig["rr"],
+        "Prix Deriv au signal : %s. Compare avec ton MT5 avant d'entrer." % fmt(sig["price"]),
+        "Aucun ordre n'est passé : vérifie sur le graphique.",
+    ])
+
