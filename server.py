@@ -1397,7 +1397,260 @@ async def on_cleanup(app):
     task = app.get("scanner")
     if task:
         task.cancel()
+
         try:
             await task
         except asyncio.CancelledError:
             pass
+
+
+# ------------------------------------------------------------------
+# OUTILS
+# ------------------------------------------------------------------
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def cleanup():
+    now = time.time()
+    for k in [k for k, v in PENDING.items() if now - v["ts"] > 600]:
+        PENDING.pop(k, None)
+    for k in [k for k, v in SESSIONS.items() if v["exp"] < now]:
+        SESSIONS.pop(k, None)
+
+
+def get_session(request):
+    sid = request.cookies.get("sid", "")
+    s = SESSIONS.get(sid)
+    if s and s["exp"] > time.time():
+        return sid, s
+    return None, None
+
+
+def error_page(message, status=400):
+    body = (
+        "<body style='font-family:sans-serif;background:#0f1117;color:#f0f0f0;padding:20px'>"
+        "<h3>Erreur</h3><p>" + html.escape(message) + "</p>"
+        "<p><a style='color:#38bdf8' href='/'>Retour</a></p></body>"
+    )
+    return web.Response(text=body, status=status, content_type="text/html")
+
+
+def parse_json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"raw": text[:500]}
+
+
+# ------------------------------------------------------------------
+# PAGES
+# ------------------------------------------------------------------
+async def index(request):
+    return web.Response(
+        text=HTML_CONTENT,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def login(request):
+    if not APP_ID:
+        return error_page("DERIV_APP_ID est vide. Ajoute-le dans Railway > Variables.", 500)
+    cleanup()
+    verifier = b64url(secrets.token_bytes(48))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    state = secrets.token_urlsafe(24)
+    PENDING[state] = {"verifier": verifier, "ts": time.time()}
+
+    params = {
+        "response_type": "code",
+        "client_id": APP_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "trade",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    resp = web.Response(status=302, headers={"Location": AUTH_URL + "?" + urlencode(params)})
+    resp.set_cookie("oauth_state", state, max_age=600, httponly=True, secure=True, samesite="Lax")
+    return resp
+
+
+async def callback(request):
+    q = request.query
+    if "error" in q:
+        return error_page("Deriv a refusé : " + q.get("error", "") + " " + q.get("error_description", ""))
+
+    state = q.get("state", "")
+    code = q.get("code", "")
+    pending = PENDING.pop(state, None)
+    if not pending or not code or state != request.cookies.get("oauth_state"):
+        return error_page("Vérification de sécurité échouée (state). Recommence la connexion.")
+
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": APP_ID,
+        "code": code,
+        "code_verifier": pending["verifier"],
+        "redirect_uri": REDIRECT_URI,
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.post(TOKEN_URL, data=form) as r:
+                status = r.status
+                text = await r.text()
+    except Exception as e:
+        print("Erreur échange token :", repr(e))
+        return error_page("Impossible de joindre Deriv pour l'échange du token : " + str(e), 502)
+
+    data = parse_json(text)
+    if status != 200 or not isinstance(data, dict) or "access_token" not in data:
+        print("Échange token refusé :", status, text[:300])
+        return error_page("Deriv a refusé l'échange du token (code " + str(status) + "). Regarde les logs Railway.", 502)
+
+    try:
+        expires_in = int(data.get("expires_in", 3600))
+    except (TypeError, ValueError):
+        expires_in = 3600
+
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = {"token": data["access_token"], "exp": time.time() + expires_in}
+
+    resp = web.Response(status=302, headers={"Location": "/"})
+    resp.set_cookie("sid", sid, max_age=min(expires_in, 7 * 86400), httponly=True, secure=True, samesite="Lax")
+    resp.del_cookie("oauth_state")
+    return resp
+
+
+async def logout(request):
+    sid, _ = get_session(request)
+    if sid:
+        SESSIONS.pop(sid, None)
+    resp = web.Response(status=302, headers={"Location": "/"})
+    resp.del_cookie("sid")
+    return resp
+
+
+# ------------------------------------------------------------------
+# API INTERNE (appelée par la page)
+# ------------------------------------------------------------------
+async def api_me(request):
+    _, s = get_session(request)
+    return web.json_response({"logged_in": bool(s), "app_id_ok": bool(APP_ID)})
+
+
+def ntfy_etat():
+    if NTFY_TOPIC:
+        return "actives"
+    if _raw_topic:
+        return "NOM INVALIDE (lettres, chiffres, - et _ seulement, 8 à 64 caractères)"
+    return "variable NTFY_TOPIC introuvable sur le serveur"
+
+
+async def api_scanner(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    return web.json_response({
+        "derniere_analyse": STATE["last"],
+        "erreur": STATE["error"],
+        "ntfy": bool(NTFY_TOPIC),
+        "ntfy_etat": ntfy_etat(),
+        "symboles": STATE["symbols"],
+        "signaux": list(SIGNALS)[::-1],
+        "disponibles": STATE["available"][:300],
+    })
+
+
+async def api_bt_start(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    if not BT["running"]:
+        request.app["bt_task"] = asyncio.create_task(run_backtest())
+    return web.json_response({"running": True})
+
+
+async def api_bt_status(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    return web.json_response(BT)
+
+
+def deriv_headers(token):
+    return {"Authorization": "Bearer " + token, "Deriv-App-ID": APP_ID}
+
+
+async def api_accounts(request):
+    sid, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.get(API_BASE + "/trading/v1/options/accounts", headers=deriv_headers(s["token"])) as r:
+                status = r.status
+                text = await r.text()
+    except Exception as e:
+        print("Erreur liste comptes :", repr(e))
+        return web.json_response({"error": "network", "detail": str(e)}, status=502)
+    if status == 401:
+        SESSIONS.pop(sid, None)
+    return web.json_response({"status": status, "body": parse_json(text)})
+
+
+async def api_otp(request):
+    _, s = get_session(request)
+    if not s:
+        return web.json_response({"error": "not_logged_in"}, status=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    account_id = str(payload.get("account_id", ""))
+    if not ACCOUNT_RE.match(account_id):
+        return web.json_response({"error": "account_id invalide"}, status=400)
+
+    url = API_BASE + "/trading/v1/options/accounts/" + account_id + "/otp"
+    try:
+        async with aiohttp.ClientSession(timeout=TIMEOUT) as http:
+            async with http.post(url, headers=deriv_headers(s["token"])) as r:
+                status = r.status
+                text = await r.text()
+    except Exception as e:
+        print("Erreur OTP :", repr(e))
+        return web.json_response({"error": "network", "detail": str(e)}, status=502)
+
+    body = parse_json(text)
+    ws_url = None
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        ws_url = body["data"].get("url")
+    if 200 <= status < 300 and ws_url:
+        return web.json_response({"url": ws_url})
+    print("OTP refusé :", status, text[:300])
+    return web.json_response({"error": "otp_failed", "status": status, "body": body}, status=502)
+
+
+# ------------------------------------------------------------------
+# DÉMARRAGE
+# ------------------------------------------------------------------
+app = web.Application()
+app.router.add_get("/", index)
+app.router.add_get("/login", login)
+app.router.add_get("/callback", callback)
+app.router.add_get("/logout", logout)
+app.router.add_get("/api/me", api_me)
+app.router.add_get("/api/scanner", api_scanner)
+app.router.add_post("/api/backtest/start", api_bt_start)
+app.router.add_get("/api/backtest", api_bt_status)
+app.router.add_get("/api/accounts", api_accounts)
+app.router.add_post("/api/otp", api_otp)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
+
+if __name__ == "__main__":
+    print("DERIV_APP_ID défini :", bool(APP_ID))
+    print("REDIRECT_URI :", REDIRECT_URI)
+    port = int(os.environ.get("PORT", 8080))
+    web.run_app(app, host="0.0.0.0", port=port)
