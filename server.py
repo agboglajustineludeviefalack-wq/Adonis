@@ -58,112 +58,16 @@ MT5 = {
 SIDE_ONLY = {"BOOM500": "buy", "BOOM1000": "buy", "CRASH500": "sell", "CRASH1000": "sell"}
 RESOLVED = {}   # nom demandé -> vrai code chez Deriv (si on a dû le chercher par mot-clé)
 NAMES = {}      # code Deriv -> nom affiché par Deriv
-PD_RANGE = "H4"  # V7 : Fibonacci exclusivement H4
 SWING_N = int(os.environ.get("SWING_N", "2"))        # bougies de chaque côté d'un sommet/creux
-MIN_RR = 0.0  # V7 : aucun filtre minimum de RR
-EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))
-OTE_LOW = float(os.environ.get("OTE_LOW", "0.62"))
-OTE_HIGH = float(os.environ.get("OTE_HIGH", "0.79"))
-SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "0.10"))
-DAILY_FVG_TOL_ATR = float(os.environ.get("DAILY_FVG_TOL_ATR", "0.25"))   # tolérance des Equal Highs/Lows (0.05 %)
+MIN_RR = float(os.environ.get("MIN_RR", "2.0"))       # gain/risque minimum
+EQ_TOL = float(os.environ.get("EQ_TOL", "0.0005"))   # tolérance des Equal Highs/Lows (0.05 %)
 SCAN_EVERY = int(os.environ.get("SCAN_EVERY", "60"))  # secondes entre deux analyses
 H4_TTL = 240                                          # secondes avant de retélécharger le H4
-BT_DAYS = int(os.environ.get("BT_DAYS", "180"))        # durée du test historique (jours)
-
-# Mémoire du serveur (se vide si Railway redémarre : il faudra se reconnecter)
-SESSIONS = {}  # sid -> {"token": ..., "exp": ...}
-PENDING = {}   # state -> {"verifier": ..., "ts": ...}
-
-STATE = {"last": None, "error": None, "symbols": {}, "available": []}
-SIGNALS = deque(maxlen=30)
-SENT = set()
-BT = {"running": False, "done": False, "progress": "", "error": None, "results": None}
-
-
-HTML_CONTENT = r"""
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Adonis V7 - Terminal Pro</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f1117; color: #f0f0f0; padding: 15px; margin: 0; }
-  .card { background: #1a1c23; border: 1px solid #2a2e39; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
-  h3 { margin-top: 0; color: #38bdf8; font-size: 18px; }
-  select { width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 5px; background: #222; color: white; border: 1px solid #444; box-sizing: border-box; }
-  .row { display: flex; gap: 10px; margin-bottom: 10px; }
-  .col { flex: 1; }
-  .btn { display: block; box-sizing: border-box; text-align: center; text-decoration: none; border: none; padding: 10px; border-radius: 5px; width: 100%; font-weight: bold; cursor: pointer; font-size: 14px; color: white; }
-  .btn-blue { background: #2563eb; }
-  .btn-red { background: #ef4444; }
-  .btn-gray { background: #374151; }
-  .live-price { font-family: monospace; color: #4ade80; font-weight: bold; font-size: 22px; }
-  .log-item { font-size: 12px; border-left: 3px solid #38bdf8; margin-bottom: 6px; color: #cbd5e1; font-family: monospace; background: #111827; padding: 6px; border-radius: 4px; word-break: break-word; }
-  .small { font-size: 12px; color: #94a3b8; }
-  pre { white-space: pre-wrap; word-break: break-word; font-size: 11px; background: #111827; padding: 8px; border-radius: 4px; max-height: 250px; overflow: auto; }
-</style>
-</head>
-<body>
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-    <h1 style="margin:0; font-size:22px; color:#38bdf8;">⚡ Adonis Pro</h1>
-    <span id="connectionBadge" style="background:#eab308; color:white; padding:6px 12px; border-radius:20px; font-size:12px;">Déconnecté</span>
-  </div>
-
-  <div class="card" id="loginCard" style="display:none;">
-    <h3>🔐 Connexion à Deriv</h3>
-    <p class="small">Tu vas être redirigé vers Deriv pour autoriser l'application (droit demandé : trade). Ton token reste sur le serveur, jamais dans ton navigateur.</p>
-    <a class="btn btn-blue" href="/login">Se connecter avec Deriv</a>
-  </div>
-
-  <div class="card" id="scanCard" style="display:none;">
-    <h3>🛰️ Scanner (tourne sur le serveur)</h3>
-    <div id="scanMeta" class="small" style="margin-bottom:8px;"></div>
-    <div id="scanList"></div>
-    <details style="margin-top:10px;">
-      <summary class="small">Marchés disponibles chez Deriv</summary>
-      <pre id="scanSymbols"></pre>
-    </details>
-  </div>
-
-  <div class="card" id="btCard" style="display:none;">
-    <h3>🧪 Test historique</h3>
-    <p class="small">Rejoue tes règles sur le passé, marché par marché. Résultats en « R » : 1 R = ce que tu risques sur un trade (perdu = -1 R, gagné = +gain/risque). Les coûts réels (spread, glissement, commission) ne sont pas inclus.</p>
-    <button class="btn btn-blue" id="btBtn" onclick="startBacktest()">Lancer le test</button>
-    <div id="btStatus" class="small" style="margin-top:8px;"></div>
-    <div id="btList" style="margin-top:8px;"></div>
-  </div>
-
-  <div class="card" id="accountCard" style="display:none;">
-    <h3>🔗 Compte & Connexion</h3>
-    <label class="small">COMPTE</label>
-    <select id="accountSelect"></select>
-    <div class="row">
-      <button class="btn btn-blue" onclick="connectWs()">Se connecter</button>
-      <button class="btn btn-red" onclick="closeWs()">Couper</button>
-    </div>
-    <div class="row">
-      <div class="col">
-        <label class="small">COMPTE ACTIF</label>
-        <div id="brokerDisplay" style="font-family:monospace; color:#f59e0b; font-weight:bold; margin-top:6px;">Non connecté</div>
-      </div>
-      <div class="col">
-        <label class="small">SOLDE</label>
-        <div id="accountBalance" style="font-family:monospace; font-size:18px; color:#4ade80; font-weight:bold; margin-top:4px;">--</div>
-      </div>
-    </div>
-    <a class="btn btn-gray" href="/logout">Se déconnecter de Deriv</a>
-    <details style="margin-top:10px;">
-      <summary class="small">Réponse brute de Deriv (debug)</summary>
-      <pre id="debug"></pre>
-    </details>
-  </div>
-
   <div class="card" id="radarCard" style="display:none;">
     <h3>📡 Marché en direct</h3>
     <select id="marketSelect" onchange="subscribeTicker()"></select>
     <div>Prix : <span id="livePrice" class="live-price">--</span></div>
-    <p class="small">Cette zone affiche seulement le prix. Le classement A+/A/B est fait par le scanner du serveur (carte ci-dessus).</p>
+    <p class="small">Cette zone affiche seulement le prix. L'analyse A+ est faite par le scanner du serveur (carte ci-dessus).</p>
   </div>
 
   <div class="card">
@@ -264,10 +168,6 @@ async function startBacktest() {
   loadBacktest();
 }
 
-const MODE_NAMES = {
-  fvg: "Retest FVG confirmé — entrée à la clôture M15",
-  close: "Entrée à la clôture du retour dans le range"
-};
 const sign = x => (Number(x) >= 0 ? "+" : "") + x;
 
 async function loadBacktest() {
@@ -284,15 +184,12 @@ async function loadBacktest() {
   list.innerHTML = "";
   if (!j.results) return;
   const res = j.results;
-  const pct = (a, b) => b ? Math.round(a * 100 / b) : 0;
-  ["fvg", "close"].forEach(mode => {
-    const f = res.entonnoir[mode];
-    const c2 = res.combos.find(c => c.mode === mode && c.min_rr === 2);
-    const d = document.createElement("div");
-    d.className = "log-item";
-    d.textContent = MODE_NAMES[mode] + " — entonnoir (" + res.marches + " marchés, " + res.jours + " jours) : biais H4 exploitable " + pct(f.bias, f.steps) + " % du temps · bon côté de l'équilibre " + pct(f.zone, f.steps) + " % · CRT avec sweep : " + f.crt + " · entrées possibles : " + f.fvg + " · gain/risque < 2 : " + f.rr + " · signaux (RR ≥ 2) : " + (c2 ? c2.total.setups : 0);
-    list.appendChild(d);
-  });
+  const f = res.entonnoir;
+  const c2 = res.combos.find(c => c.min_rr === 2);
+  const head = document.createElement("div");
+  head.className = "log-item";
+  head.textContent = "Entonnoir (" + res.marches + " marchés, " + res.jours + " jours) : CRT H4 détectés : " + f.crt + " · FVG M15 repérés : " + f.fvg + " · rejetés par gain/risque < 2 : " + f.rr + " · signaux (RR ≥ 2) : " + (c2 ? c2.total.setups : 0);
+  list.appendChild(head);
   res.combos.forEach(c => {
     const t = c.total;
     const done = t.gagnes + t.perdus + t.expires;
@@ -301,24 +198,12 @@ async function loadBacktest() {
     det.className = "log-item";
     det.style.borderLeftColor = t.r_total > 0 ? "#22c55e" : "#ef4444";
     const sm = document.createElement("summary");
-    sm.textContent = MODE_NAMES[c.mode] + " · RR ≥ " + c.min_rr + " : " + t.setups + " trades · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + sign(t.r_total) + " R (" + sign(per) + " R/trade) · avant les " + res.jours_new + " derniers jours : " + t.n_old + " trades, " + sign(t.r_old) + " R · " + res.jours_new + " derniers jours : " + t.n_new + " trades, " + sign(t.r_new) + " R";
+    sm.textContent = "CRT H4 + rejet du FVG M15 · RR ≥ " + c.min_rr + " : " + t.setups + " trades · " + t.gagnes + " gagnés · " + t.perdus + " perdus · " + sign(t.r_total) + " R (" + sign(per) + " R/trade) · avant les " + res.jours_new + " derniers jours : " + t.n_old + " trades, " + sign(t.r_old) + " R · " + res.jours_new + " derniers jours : " + t.n_new + " trades, " + sign(t.r_new) + " R";
     det.appendChild(sm);
-    const audit = document.createElement("div");
-    audit.style.marginTop = "6px";
-    audit.style.padding = "8px";
-    audit.style.background = "rgba(255,255,255,.04)";
-    const p = t.periods || [];
-    const pf = t.profit_factor === null ? "—" : (t.profit_factor === "inf" ? "∞" : t.profit_factor);
-    audit.textContent = "Audit : PF " + pf + " · espérance " + sign(t.expectancy_r) + " R/trade · drawdown max " + t.max_drawdown_r + " R · série max pertes " + t.max_pertes_consecutives +
-      " · sans top 1/2/3/5 : " + [t.sans_best1_r, t.sans_best2_r, t.sans_best3_r, t.sans_best5_r].map(x => sign(x) + " R").join(" / ") +
-      " · périodes : " + p.map((x, i) => "P" + (i + 1) + " " + x.n + " trades / " + sign(x.r) + " R").join(" · ");
-    det.appendChild(audit);
     c.lignes.forEach(l => {
       const d = document.createElement("div");
       d.style.marginTop = "4px";
-      const bpf = l.achats_pf === null ? "—" : (l.achats_pf === "inf" ? "∞" : l.achats_pf);
-      const spf = l.ventes_pf === null ? "—" : (l.ventes_pf === "inf" ? "∞" : l.ventes_pf);
-      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R · PF " + (l.profit_factor === null ? "—" : (l.profit_factor === "inf" ? "∞" : l.profit_factor)) + " · DD " + l.max_drawdown_r + " R · ACHATS " + l.achats + " trades / " + sign(l.r_achats) + " R / PF " + bpf + " / esp. " + sign(l.achats_expectancy_r) + " R · VENTES " + l.ventes + " trades / " + sign(l.r_ventes) + " R / PF " + spf + " / esp. " + sign(l.ventes_expectancy_r) + " R");
+      d.textContent = l.erreur ? (l.symbole + " — erreur : " + l.erreur) : (l.symbole + " — " + l.setups + " trades · " + l.gagnes + " G · " + l.perdus + " P · " + sign(l.r_total) + " R (achats " + l.achats + " : " + sign(l.r_achats) + " R, ventes " + l.ventes + " : " + sign(l.r_ventes) + " R)");
       det.appendChild(d);
     });
     list.appendChild(det);
@@ -326,7 +211,7 @@ async function loadBacktest() {
   const note = document.createElement("div");
   note.className = "small";
   note.style.marginTop = "6px";
-  note.textContent = "V7 : Fibonacci H4 OTE 62–79 %, CRT H4, FVG M15 rejeté, SL derrière le FVG avec buffer ATR, TP liquidité H4/D1 et trailing par FVG M15. Les seuils RR affichés sont des statistiques, jamais des filtres d’entrée.";
+  note.textContent = "Rappel : sans spread ni commission. Moins de 100 trades par variante = on ne peut rien conclure.";
   list.appendChild(note);
 }
 
@@ -499,187 +384,245 @@ window.onload = init;
 
 
 # ==================================================================
-#  ANALYSE (CRT H4 + biais Daily/H4 + discount/premium + FVG M15)
+#  ANALYSE : CRT en H4, puis FVG en M15, puis entrée au REJET du FVG.
+#  Plus de biais de structure, plus de discount/premium, plus de veto Daily.
 #  Les fonctions ci-dessous ne font aucun appel réseau.
 #  Chaque bougie = {"t": début en secondes, "o", "h", "l", "c"}
 #  Pour les VENTES, on inverse les prix (miroir) et on réutilise
 #  exactement la logique des ACHATS, puis on remet les prix à l'endroit.
+#
+#  La stratégie, étape par étape (version ACHAT) :
+#   1. H4 : la bougie 1 crée un range (son haut et son bas).
+#   2. H4 : la bougie 2 mèche SOUS le bas de la bougie 1 (sans dépasser son haut)
+#      et CLÔTURE à l'intérieur du range. On ne descend en M15 qu'à ce moment-là.
+#   3. M15 : le retour dans le range a laissé un FVG haussier (après le point de sweep).
+#   4. M15 : quand une bougie touche le FVG et CLÔTURE AU-DESSUS de lui, c'est un rejet :
+#      signal d'entrée à la clôture de cette bougie (après la clôture de la bougie 2 H4).
+#   5. Stop sous le point de sweep, TP sur la prochaine liquidité, gain/risque minimum.
+#  VENTE = exactement l'inverse (sweep du haut, FVG baissier).
 # ==================================================================
-RANK = {"no_range": 0, "not_in_zone": 1, "no_crt": 2, "no_sweep": 3,
-        "no_reentry": 4, "no_fvg": 5, "waiting_retrace": 6, "rr_low": 7, "signal": 8}
-ARROW = {"up": "↑", "down": "↓", None: "?"}
-MARKET_HISTORY = {}
+RANK = {"no_crt": 0, "crt_invalid": 1, "no_fvg": 2, "waiting_retrace": 3, "rr_low": 4, "signal": 5}
 
 
-def real(sym): return RESOLVED.get(sym, sym)
-def label(sym): return MT5.get(sym, sym)
-def side_allowed(only, side): return not only or only == side
-def pick_side(b_d1, b_h4): return b_h4  # H4 dirige; D1 sert aux liquidités, sans veto
-def fmt(x): return ("%.2f" % x) if abs(x) >= 100 else ("%.5f" % x)
+def real(sym):
+    return RESOLVED.get(sym, sym)
+
+
+def label(sym):
+    return MT5.get(sym, sym)
+
+
+def allowed(only, sd):
+    """Boom = achats seulement, Crash = ventes seulement (sd vaut 'buy' ou 'sell')."""
+    return not only or only == sd
+
+
+def fmt(x):
+    return ("%.2f" % x) if abs(x) >= 100 else ("%.5f" % x)
+
+
 def split_closed(cs, gran, now):
-    closed=[c for c in cs if c["t"]+gran<=now]
-    forming=[c for c in cs if c["t"]+gran>now]
-    return closed,(forming[-1] if forming else None)
+    closed = [c for c in cs if c["t"] + gran <= now]
+    forming = [c for c in cs if c["t"] + gran > now]
+    return closed, (forming[-1] if forming else None)
 
-def swings(cs, n=SWING_N):
-    highs=[]; lows=[]
-    for i in range(n,len(cs)-n):
-        h,l=cs[i]["h"],cs[i]["l"]
-        if all(h>cs[i-k]["h"] for k in range(1,n+1)) and all(h>=cs[i+k]["h"] for k in range(1,n+1)): highs.append((i,h))
-        if all(l<cs[i-k]["l"] for k in range(1,n+1)) and all(l<=cs[i+k]["l"] for k in range(1,n+1)): lows.append((i,l))
-    return highs,lows
 
-def structure_bias(cs,n=SWING_N):
-    hs,ls=swings(cs,n)
-    if len(hs)<2 or len(ls)<2: return None
-    if hs[-1][1]>hs[-2][1] and ls[-1][1]>ls[-2][1]: return "up"
-    if hs[-1][1]<hs[-2][1] and ls[-1][1]<ls[-2][1]: return "down"
+def mirror(cs):
+    return [{"t": c["t"], "o": -c["o"], "h": -c["l"], "l": -c["h"], "c": -c["c"]} for c in cs]
+
+
+def mirror_one(c):
+    return None if c is None else mirror([c])[0]
+
+
+def swings(cs, n):
+    highs, lows = [], []
+    for i in range(n, len(cs) - n):
+        h, l = cs[i]["h"], cs[i]["l"]
+        if all(h > cs[i - k]["h"] for k in range(1, n + 1)) and all(h >= cs[i + k]["h"] for k in range(1, n + 1)):
+            highs.append((i, h))
+        if all(l < cs[i - k]["l"] for k in range(1, n + 1)) and all(l <= cs[i + k]["l"] for k in range(1, n + 1)):
+            lows.append((i, l))
+    return highs, lows
+
+
+def pick_tp(entry, h4c, c1_high):
+    """Prochaine liquidité au-dessus de l'entrée : Equal Highs, sommet H4 ou haut du CRT (le plus proche)."""
+    hs, _ = swings(h4c[-150:], SWING_N)
+    levels = [h for _, h in hs if h > entry]
+    if c1_high > entry:
+        levels.append(c1_high)
+    if not levels:
+        return None, None
+    tp = min(levels)
+    near = [h for _, h in hs if abs(h - tp) <= abs(tp) * EQ_TOL]
+    if len(near) >= 2:
+        label_ = "Equal Highs"
+    elif tp == c1_high:
+        label_ = "haut du CRT"
+    else:
+        label_ = "sommet H4"
+    return tp, label_
+
+
+def crt_buy(c1, c2):
+    """CRT d'achat en H4 : la bougie 2 mèche SOUS le bas de la bougie 1, ne dépasse pas son haut,
+    et clôture à l'intérieur du range de la bougie 1."""
+    return c2["l"] < c1["l"] and c2["h"] <= c1["h"] and c1["l"] < c2["c"] <= c1["h"]
+
+
+def crt_dir(c1, c2):
+    """'buy' (sweep du bas), 'sell' (sweep du haut) ou None."""
+    if crt_buy(c1, c2):
+        return "buy"
+    if crt_buy(mirror_one(c1), mirror_one(c2)):
+        return "sell"
     return None
 
-def fib_ote(cs, side):
-    """Dernier swing confirmé opposé -> swing confirmé le plus récent, sans lookahead."""
-    hs,ls=swings(cs,SWING_N)
-    if not hs or not ls: return None
-    if side=="buy":
-        hi_i,hi=hs[-1]
-        prior=[(i,v) for i,v in ls if i<hi_i]
-        if not prior: return None
-        lo_i,lo=prior[-1]
-        if hi<=lo: return None
-        span=hi-lo
-        return (hi-span*OTE_HIGH, hi-span*OTE_LOW, lo, hi)
-    lo_i,lo=ls[-1]
-    prior=[(i,v) for i,v in hs if i<lo_i]
-    if not prior: return None
-    hi_i,hi=prior[-1]
-    if hi<=lo: return None
-    span=hi-lo
-    return (lo+span*OTE_LOW, lo+span*OTE_HIGH, lo, hi)
 
-def atr(cs, period=14):
-    if len(cs)<period+1: return None
-    trs=[]
-    for a,b in zip(cs[-period-1:-1],cs[-period:]):
-        trs.append(max(b["h"]-b["l"],abs(b["h"]-a["c"]),abs(b["l"]-a["c"])))
-    return sum(trs)/len(trs) if trs else None
+def crt_entry(c1, c2, m15c, h4c, min_rr=None):
+    """Partie M15 d'un CRT d'achat déjà validé en H4. Toutes les M15 sont CLÔTURÉES."""
+    min_rr = MIN_RR if min_rr is None else min_rr
+    base = {"c1_t": c1["t"], "c1_high": c1["h"], "c1_low": c1["l"], "c2_t": c2["t"]}
+    c2_end = c2["t"] + 14400
 
-def fvg_zones(cs, side):
-    out=[]
-    for i in range(2,len(cs)):
-        a,c=cs[i-2],cs[i]
-        if side=="buy" and c["l"]>a["h"]: out.append((i,a["h"],c["l"],cs[i]["t"]))
-        if side=="sell" and c["h"]<a["l"]: out.append((i,c["h"],a["l"],cs[i]["t"]))
+    in_c2 = [(i, m) for i, m in enumerate(m15c) if c2["t"] <= m["t"] < c2_end]
+    after = [m for m in m15c if m["t"] >= c2_end]
+    if not in_c2 or not after:
+        return dict(base, code="no_fvg")   # on ne descend en M15 qu'APRÈS la clôture de la bougie 2
+    k_low, low_m = min(in_c2, key=lambda x: x[1]["l"])
+    sweep_low = min(c2["l"], low_m["l"])
+    if min(m["l"] for m in after) < sweep_low:
+        return dict(base, code="crt_invalid")   # le prix a repris le point de sweep : le CRT a échoué
+
+    # FVG haussiers formés par le retour dans le range, à partir du point de sweep.
+    n = len(m15c)
+    cands = []
+    for i in range(k_low, n - 3):          # il reste au moins une bougie distincte après le FVG
+        a, c = m15c[i], m15c[i + 2]
+        if c["l"] > a["h"]:
+            bottom, top = a["h"], c["l"]
+            if any(m15c[k]["c"] < bottom for k in range(i + 3, n)):
+                continue                    # une clôture sous le bas du FVG l'invalide
+            cands.append((i, bottom, top))
+    if not cands:
+        return dict(base, code="no_fvg")
+
+    # Rejet : la dernière M15 clôturée touche le FVG (bas <= haut du FVG) et CLÔTURE AU-DESSUS.
+    last = m15c[-1]
+    sel = None
+    for i, bottom, top in reversed(cands):
+        if last["l"] <= top and last["c"] > top:
+            sel = (i, bottom, top)
+            break
+    if sel is None:
+        i, bottom, top = cands[-1]
+        return dict(base, code="waiting_retrace", fvg_bottom=bottom, fvg_top=top,
+                    fvg_t=m15c[i]["t"], sweep_low=sweep_low)
+
+    i, bottom, top = sel
+    entry = last["c"]
+    out = dict(base, fvg_bottom=bottom, fvg_top=top, fvg_t=m15c[i]["t"],
+               sweep_low=sweep_low, retest_t=last["t"])
+    if entry <= sweep_low:
+        out["code"] = "rr_low"
+        return out
+    tp, label_ = pick_tp(entry, h4c, c1["h"])
+    if tp is None or tp <= entry:
+        out["code"] = "rr_low"
+        return out
+    risk = entry - sweep_low
+    rr = (tp - entry) / risk
+    out.update(entry=entry, sl=sweep_low, tp=tp, tp_label=label_, rr=rr)
+    out["code"] = "signal" if rr >= min_rr else "rr_low"
     return out
 
-def nearest_liquidity(entry,h4c,side,crt):
-    hs,ls=swings(h4c[-250:],SWING_N)
-    levels=[v for _,v in (hs if side=="buy" else ls) if (v>entry if side=="buy" else v<entry)]
-    edge=crt["h"] if side=="buy" else crt["l"]
-    if (edge>entry if side=="buy" else edge<entry): levels.append(edge)
-    if not levels: return None,"aucune liquidité H4 identifiée"
-    target=min(levels) if side=="buy" else max(levels)
-    return target,"liquidité H4 (swing/CRT)"
 
-def daily_fvg_target(d1c,h4_target,side,m15c):
-    zones=fvg_zones(d1c,side)
-    av=atr(m15c) or abs(h4_target)*0.0005
-    tol=av*DAILY_FVG_TOL_ATR
-    candidates=[]
-    for _,lo,hi,t in zones:
-        # Un pool D1 doit être sur le chemin et chevaucher/approcher le TP H4.
-        if lo-tol<=h4_target<=hi+tol:
-            candidates.append((lo,hi,t))
-    if not candidates: return h4_target,"liquidité H4"
-    lo,hi,_=min(candidates,key=lambda z:abs((z[0]+z[1])/2-h4_target))
-    return ((hi if side=="buy" else lo)),"FVG D1 au niveau du TP H4"
+def evaluate_buy(h4c, m15c, min_rr=None):
+    if len(h4c) < 2 or not m15c:
+        return {"code": "no_crt"}
+    c1, c2 = h4c[-2], h4c[-1]          # les 2 dernières bougies H4 CLÔTURÉES
+    if not crt_buy(c1, c2):
+        return {"code": "no_crt"}
+    return crt_entry(c1, c2, m15c, h4c, min_rr)
 
-def classify_setup(sym,sig):
-    rr=float(sig.get("rr",0) or 0)
-    return ("A+" if rr>=3.5 else "A" if rr>=2 else "B", "classement descriptif uniquement; aucun filtre historique")
 
-def refresh_market_history(alltr): return None
+def unmirror(m):
+    out = dict(m)
+    if "fvg_bottom" in m:
+        out["fvg_bottom"], out["fvg_top"] = -m["fvg_top"], -m["fvg_bottom"]
+    if "c1_high" in m:
+        out["c1_low"], out["c1_high"] = -m["c1_high"], -m["c1_low"]
+    for k in ("entry", "sl", "tp", "sweep_low"):
+        if k in m:
+            out[k] = -m[k]
+    labels = {"Equal Highs": "Equal Lows", "haut du CRT": "bas du CRT", "sommet H4": "creux H4"}
+    if "tp_label" in m:
+        out["tp_label"] = labels.get(m["tp_label"], m["tp_label"])
+    return out
 
-def _find_side_signal(side,h4c,h4f,m15c,d1c):
-    if len(h4c)<20 or len(m15c)<30: return {"code":"no_range"}
-    fib=fib_ote(h4c,side)
-    if not fib: return {"code":"no_range"}
-    zlo,zhi,swing_lo,swing_hi=fib
-    px=m15c[-1]["c"]
-    # CRT : la première H4 définit le range; la seconde balaie un seul côté puis clôture dedans.
-    pairs=[]
-    # CRT confirmé uniquement à la clôture de la deuxième bougie H4.
-    if len(h4c)>=2: pairs.append((h4c[-2],h4c[-1]))
-    for c1,c2 in reversed(pairs):
-        sweep=(c2["l"]<c1["l"] and c2["h"]<=c1["h"]) if side=="buy" else (c2["h"]>c1["h"] and c2["l"]>=c1["l"])
-        reentry=(c1["l"]<c2["c"]<=c1["h"]) if side=="buy" else (c1["l"]<=c2["c"]<c1["h"])
-        if not (sweep and reentry): continue
-        if not zlo <= c2["c"] <= zhi: continue
-        # M15 FVG formé après la clôture de réintégration H4.
-        post=[m for m in m15c if m["t"]>=c2["t"]+14400]
-        if len(post)<4: continue
-        zones=fvg_zones(post,side)
-        if not zones: continue
-        # Le dernier FVG valide est suivi; rejet = retest du bord proche et clôture hors zone.
-        last=post[-1]; chosen=None
-        for idx,lo,hi,ft in reversed(zones):
-            later=post[idx+1:]
-            invalid=any((x["c"]<lo if side=="buy" else x["c"]>hi) for x in later)
-            if invalid: continue
-            if side=="buy": rejected=last["l"]<=hi and last["h"]>=lo and last["c"]>hi
-            else: rejected=last["h"]>=lo and last["l"]<=hi and last["c"]<lo
-            if rejected: chosen=(lo,hi,ft); break
-        if not chosen: return {"code":"waiting_retrace","c1_t":c1["t"]}
-        lo,hi,ft=chosen
-        entry=last["c"]
-        a=atr(m15c) or abs(entry)*0.0005
-        buffer=a*SL_ATR_MULT
-        sl=(lo-buffer) if side=="buy" else (hi+buffer)
-        risk=abs(entry-sl)
-        if risk<=0: continue
-        tp,tp_label=nearest_liquidity(entry,h4c,side,c1)
-        if tp is None: continue
-        tp,tp_label=daily_fvg_target(d1c,tp,side,m15c)
-        if (tp<=entry if side=="buy" else tp>=entry): continue
-        rr=abs(tp-entry)/risk
-        return {"code":"signal","side":side,"entry":entry,"sl":sl,"tp":tp,"tp_label":tp_label,
-                "rr":rr,"price":px,"c1_t":c1["t"],"c1_high":c1["h"],"c1_low":c1["l"],
-                "fvg_t":ft,"fvg_bottom":lo,"fvg_top":hi,"reentry_t":c2["t"],
-                "reentry_o":c2["o"],"reentry_h":c2["h"],"reentry_l":c2["l"],"reentry_c":c2["c"],
-                "sweep_t":c2["t"],"sweep_low":c2["l"],"ote_low":zlo,"ote_high":zhi}
-    return {"code":"not_in_zone" if not (zlo <= px <= zhi) else "no_crt","ote_low":zlo,"ote_high":zhi}
 
-def analyze_core(d1c,h4c,h4f,m15c,m15f,biases=None,only=None,mode=None,min_rr=None):
-    if len(d1c)<20 or len(h4c)<30 or len(m15c)<30:
-        return {"resume":"historique insuffisant"},None
-    bias=structure_bias(h4c,SWING_N)
-    side="buy" if bias=="up" else "sell" if bias=="down" else None
-    if side is None: return {"resume":"structure H4 indéterminée; pas de setup"},None
-    if not side_allowed(only,side): return {"resume":"restriction directionnelle du marché"},None
-    res=_find_side_signal(side,h4c,h4f,m15c,d1c)
-    msg={"no_range":"swings confirmés insuffisants pour Fibonacci","not_in_zone":"prix hors OTE 62–79 %",
-         "no_crt":"pas de CRT H4 valide dans l'OTE","waiting_retrace":"FVG M15 en attente de rejet","signal":"SETUP V7"}
-    info={"resume":"H4 %s · %s"%(ARROW[bias],msg.get(res.get("code"),"analyse V7")),"code":res.get("code"),"c1_t":res.get("c1_t"),"fvg_t":res.get("fvg_t"),"rr":res.get("rr")}
-    if res.get("code")!="signal": return info,None
-    return info,res
+def analyze(sym, h4, m15, now):
+    """Version en direct : ne garde que les bougies CLÔTURÉES, puis analyse."""
+    if m15 and now - (m15[-1]["t"] + 900) > 1800:
+        return {"resume": "marché fermé ou données anciennes"}, None
+    h4c, _ = split_closed(h4, 14400, now)
+    m15c, _ = split_closed(m15, 900, now)
+    return analyze_core(h4c, m15c, SIDE_ONLY.get(sym))
 
-def analyze(sym,d1,h4,m15,now):
-    if m15 and now-(m15[-1]["t"]+900)>1800: return {"resume":"marché fermé ou données anciennes"},None
-    d1c,_=split_closed(d1,86400,now); h4c,h4f=split_closed(h4,14400,now); m15c,m15f=split_closed(m15,900,now)
-    info,sig=analyze_core(d1c,h4c,h4f,m15c,m15f,None,SIDE_ONLY.get(sym))
-    if sig:
-        grade,reason=classify_setup(sym,sig); sig["grade"]=grade; sig["grade_reason"]=reason
-        info["grade"]=grade; info["grade_reason"]=reason; info["resume"]+=" · "+grade
-    return info,sig
 
-def build_text(sym,sig):
-    buy=sig["side"]=="buy"
-    return "\n".join(["%s %s — ADONIS V7"%("ACHAT" if buy else "VENTE",label(sym)),
-      "Fibonacci H4 OTE 62–79 % · CRT H4 sweep + clôture de réintégration",
-      "FVG M15 post-réintégration rejeté · entrée clôture M15 : %s"%fmt(sig["entry"]),
-      "SL derrière FVG + buffer ATR(14) × %.3f : %s"%(SL_ATR_MULT,fmt(sig["sl"])),
-      "TP : %s (%s)"%(fmt(sig["tp"]),sig["tp_label"]),"RR indicatif : %.2f"%sig["rr"],
-      "Structure H4, price action CRT et liquidités; aucun ordre n'est passé automatiquement.",
-      "Vérifie le prix et le spread sur MT5 avant toute exécution."])
+def analyze_core(h4c, m15c, only=None, min_rr=None):
+    """Retourne (infos_pour_la_page, signal_ou_None)."""
+    if len(h4c) < 15 or len(m15c) < 15:
+        return {"resume": "pas assez de bougies reçues (H4 %d, M15 %d)" % (len(h4c), len(m15c)), "code": "no_crt"}, None
+
+    px = " · prix " + fmt(m15c[-1]["c"])
+    c1, c2 = h4c[-2], h4c[-1]
+    sd = crt_dir(c1, c2)
+    if sd is None:
+        return {"resume": "pas de CRT H4 sur les 2 dernières bougies (la 2e doit mécher UN côté de la 1re et clôturer dedans)" + px,
+                "code": "no_crt"}, None
+    word = "d'achat (sweep du bas)" if sd == "buy" else "de vente (sweep du haut)"
+    if not allowed(only, sd):
+        return {"resume": "CRT H4 %s détecté, mais ici on ne trade que les %s (spikes) : pas de trade%s" % (
+            word, "achats" if only == "buy" else "ventes", px), "code": "no_crt"}, None
+
+    if sd == "buy":
+        res = evaluate_buy(h4c, m15c, min_rr)
+    else:
+        res = unmirror(evaluate_buy(mirror(h4c), mirror(m15c), min_rr))
+
+    code = res["code"]
+    msgs = {
+        "no_crt": "pas de CRT H4",
+        "crt_invalid": "CRT H4 %s invalidé (le prix a repris le point de sweep)" % word,
+        "no_fvg": "CRT H4 %s validé, pas encore de FVG M15 exploitable (ou bougie 3 pas commencée)" % word,
+        "waiting_retrace": "CRT H4 %s validé, FVG M15 repéré, attente du rejet du FVG" % word,
+        "rr_low": "rejet du FVG vu mais gain/risque trop faible (%s)" % (("%.1f" % res["rr"]) if "rr" in res else "pas de cible"),
+        "signal": "SETUP A+ (CRT H4 + rejet du FVG M15)",
+    }
+    info = {"resume": msgs[code] + px, "code": code,
+            "c1_t": res.get("c1_t"), "fvg_t": res.get("fvg_t"), "rr": res.get("rr")}
+    if code == "signal":
+        sig = dict(res)
+        sig["side"] = sd
+        return info, sig
+    return info, None
+
+
+def build_text(sym, sig):
+    buy = sig["side"] == "buy"
+    return "\n".join([
+        "%s %s - Setup A+" % ("ACHAT" if buy else "VENTE", label(sym)),
+        "CRT H4 : la bougie 2 a mèché le %s de la bougie 1 puis clôturé dans son range" % ("bas" if buy else "haut"),
+        "FVG M15 rejeté : %s - %s" % (fmt(sig["fvg_bottom"]), fmt(sig["fvg_top"])),
+        "Entrée repère (clôture M15 du rejet) : %s" % fmt(sig["entry"]),
+        "Stop : %s (distance %s, soit %.2f%% du prix)" % (fmt(sig["sl"]), fmt(abs(sig["entry"] - sig["sl"])), abs(sig["entry"] - sig["sl"]) / abs(sig["entry"]) * 100),
+        "TP : %s (%s, soit %.2f%% du prix)" % (fmt(sig["tp"]), sig["tp_label"], abs(sig["tp"] - sig["entry"]) / abs(sig["entry"]) * 100),
+        "Gain/risque : %.1f pour 1" % sig["rr"],
+        "Prix Deriv au signal : %s. Compare avec ton MT5 avant d'entrer." % fmt(sig["entry"]),
+        "Aucun ordre n'est passé : vérifie sur le graphique.",
+    ])
 
 
 # ==================================================================
@@ -790,7 +733,7 @@ async def handle_signal(sym, sig):
     text = build_text(sym, sig)
     SIGNALS.append({"heure": time.strftime("%H:%M:%S", time.gmtime()) + " UTC", "texte": text})
     print("SIGNAL", sym, sig["side"])
-    await send_ntfy("Setup %s %s %s" % (sig.get("grade", "B"), label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
+    await send_ntfy("Setup A+ %s %s" % (label(sym), "ACHAT" if sig["side"] == "buy" else "VENTE"), text)
 
 
 def stale(fetched, now, ttl, gran):
@@ -801,13 +744,11 @@ async def scan_once(ws, cache):
     for sym in SYMBOLS:
         try:
             now = time.time()
-            ck, hk = (sym, 86400), (sym, 14400)
-            if ck not in cache or stale(cache[ck][0], now, 900, 86400):
-                cache[ck] = (now, await fetch_candles(ws, real(sym), 86400, 150))
+            hk = (sym, 14400)
             if hk not in cache or stale(cache[hk][0], now, H4_TTL, 14400):
                 cache[hk] = (now, await fetch_candles(ws, real(sym), 14400, 300))
             m15 = await fetch_candles(ws, real(sym), 900, 300)
-            info, sig = analyze(sym, cache[ck][1], cache[hk][1], m15, time.time())
+            info, sig = analyze(sym, cache[hk][1], m15, time.time())
         except ApiError as e:
             if "rate" in str(e).lower():
                 STATE["error"] = "limite de requêtes Deriv atteinte, nouvel essai au prochain tour"
@@ -861,102 +802,67 @@ async def scanner_loop():
 
 
 # ==================================================================
-#  TEST HISTORIQUE : rejoue les règles sur le passé, bougie M15 par bougie M15
-#  Règles anti-triche : à chaque instant, l'analyse ne voit que ce qui existait.
-#  La bougie H4 « en cours » est reconstruite avec les M15 déjà fermées.
+#  TEST HISTORIQUE : rejoue la stratégie sur le passé, bougie M15 par bougie M15.
+#  Règle anti-triche : à chaque instant, l'analyse ne voit que des bougies CLÔTURÉES
+#  (H4 et M15) qui existaient réellement à ce moment-là.
 # ==================================================================
-def partial_candle(m15, i, T, period):
-    p = (T // period) * period
-    k = i
-    while k >= 0 and m15[k]["t"] >= p:
-        k -= 1
-    seg = m15[k + 1:i + 1]
-    if not seg:
-        return None
-    return {"t": p, "o": seg[0]["o"], "h": max(x["h"] for x in seg),
-            "l": min(x["l"] for x in seg), "c": seg[-1]["c"]}
-
-
 def simulate(sig, m15, i, max_bars=288):
-    """V7 trailing : après contact du bord directionnel du FVG initial,
-    un nouveau FVG M15 rejeté déplace le SL. SL prioritaire en cas d'ambiguïté."""
-    buy=sig["side"]=="buy"; entry=float(sig["entry"]); sl=float(sig["sl"]); tp=float(sig["tp"])
-    risk=abs(entry-sl)
-    if risk<=0 or i<0 or i>=len(m15): return "invalid",0.0,i
-    lo=float(sig.get("fvg_bottom",entry)); hi=float(sig.get("fvg_top",entry))
-    armed=False; zone=None; last_j=min(len(m15)-1,i+max_bars)
-    for j in range(i+1,last_j+1):
-        c=m15[j]
-        if not armed: armed=(c["h"]>=hi) if buy else (c["l"]<=lo)
-        if armed and j>=2:
-            a=m15[j-2]
-            if buy and c["l"]>a["h"]: zone=(a["h"],c["l"],j)
-            elif not buy and c["h"]<a["l"]: zone=(c["h"],a["l"],j)
-        if zone and j>zone[2]:
-            zl,zh,_=zone
-            av=atr(m15[max(0,j-20):j+1]) or abs(entry)*0.0005
-            if buy and c["l"]<=zh and c["c"]>zh:
-                sl=max(sl,zl-av*SL_ATR_MULT); zone=None
-            elif not buy and c["h"]>=zl and c["c"]<zl:
-                sl=min(sl,zh+av*SL_ATR_MULT); zone=None
-        hit_sl=(c["l"]<=sl) if buy else (c["h"]>=sl)
-        hit_tp=(c["h"]>=tp) if buy else (c["l"]<=tp)
-        if hit_sl: return "loss",((sl-entry)/risk if buy else (entry-sl)/risk),j
-        if hit_tp: return "win",((tp-entry)/risk if buy else (entry-tp)/risk),j
-    close=m15[last_j]["c"]; r=((close-entry) if buy else (entry-close))/risk
-    return ("timeout" if i+max_bars<len(m15) else "open"),r,last_j
-
-FUNNEL_RR = 2.0
+    """Suit le trade après le signal. Si stop et TP sont touchés dans la même bougie : stop (pessimiste)."""
+    buy = sig["side"] == "buy"
+    entry, sl, tp = sig["entry"], sig["sl"], sig["tp"]
+    risk = abs(entry - sl)
+    last_j = min(len(m15) - 1, i + max_bars)
+    for j in range(i + 1, last_j + 1):
+        c = m15[j]
+        hit_sl = (c["l"] <= sl) if buy else (c["h"] >= sl)
+        hit_tp = (c["h"] >= tp) if buy else (c["l"] <= tp)
+        if hit_sl:
+            return "loss", -1.0, j
+        if hit_tp:
+            return "win", sig["rr"], j
+    close = m15[last_j]["c"]
+    r = ((close - entry) if buy else (entry - close)) / risk
+    return ("timeout" if i + max_bars < len(m15) else "open"), r, last_j
 
 
-async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
+async def replay(h4, m15, start_i, only=None, thresholds=None):
     thresholds = tuple(thresholds or (MIN_RR,))
     lo_rr = min(thresholds)
-    d1_t = [c["t"] for c in d1]
     h4_t = [c["t"] for c in h4]
-    cache = {}
+    crt_cache = {}
     seen = {t: set() for t in thresholds}
     trades = {t: [] for t in thresholds}
     busy = {t: -1 for t in thresholds}
-    st = {"steps": 0, "bias": 0, "zone": 0, "crt": set(), "fvg": set(), "rr": set()}
+    st = {"steps": 0, "crt": set(), "fvg": set(), "rr": set()}
     for i in range(start_i, len(m15)):
         if i % 200 == 0:
             await asyncio.sleep(0)  # laisse respirer le serveur
         T = m15[i]["t"] + 900
-        kd = bisect_right(d1_t, T - 86400)
-        kh = bisect_right(h4_t, T - 14400)
-        if kd < 15 or kh < 15:
+        kh = bisect_right(h4_t, T - 14400)   # bougies H4 CLÔTURÉES à l'instant T
+        if kh < 16:
             continue
-        key = (kd, kh)
-        if key not in cache:
-            cache[key] = (None, structure_bias(h4[max(0, kh - 300):kh], SWING_N))
-        b_d1, b_h4 = cache[key]
         st["steps"] += 1
-        side = pick_side(b_d1, b_h4)
-        if side is None or not side_allowed(only, side):
+        sd = crt_cache.get(kh, "?")
+        if sd == "?":
+            sd = crt_dir(h4[kh - 2], h4[kh - 1])
+            crt_cache[kh] = sd
+        if sd is None or not allowed(only, sd):
             continue
-        st["bias"] += 1
         free = [t for t in thresholds if i > busy[t]]
         if not free:
             continue
-        d1c = d1[max(0, kd - 150):kd]
         h4c = h4[max(0, kh - 300):kh]
         m15c = m15[max(0, i + 1 - 300):i + 1]
-        h4f = partial_candle(m15, i, T, 14400)
-        info, sig = analyze_core(d1c, h4c, h4f, m15c, None, (b_d1, b_h4), only, mode, 0.0)
+        info, sig = analyze_core(h4c, m15c, only, lo_rr)
         rk = RANK.get(info.get("code"), -1)
-        if rk >= RANK["no_crt"]:
-            st["zone"] += 1
-        # Compter un CRT avec sweep uniquement après la détection effective
-        # du sweep M15. Le code "no_sweep" signifie précisément qu'il manque.
-        if rk > RANK["no_sweep"] and info.get("c1_t"):
+        if rk >= RANK["crt_invalid"] and info.get("c1_t"):
             st["crt"].add(info["c1_t"])
         k2 = (info.get("c1_t"), info.get("fvg_t"))
         if rk >= RANK["waiting_retrace"] and k2[0] and k2[1]:
             st["fvg"].add(k2)
         if info.get("code") in ("rr_low", "signal") and k2[0] and k2[1]:
             rr_v = sig["rr"] if sig else info.get("rr")
-            if rr_v is None or rr_v < FUNNEL_RR:
+            if rr_v is None or rr_v < MIN_RR:
                 st["rr"].add(k2)
         if not sig:
             continue
@@ -968,149 +874,36 @@ async def replay(d1, h4, m15, start_i, only=None, mode="fvg", thresholds=None):
                 if outcome is None:
                     outcome = simulate(sig, m15, i)
                 res, r, j = outcome
-                exit_t = int(m15[j]["t"] + 900) if 0 <= j < len(m15) else None
-                trades[thr].append({
-                    "sym": None, "side": sig["side"], "t": T,
-                    "signal_t": T, "exit_t": exit_t,
-                    "res": res, "r": round(float(r), 5), "rr": round(float(sig["rr"]), 5),
-                    "entry": sig.get("entry"), "sl": sig.get("sl"), "tp": sig.get("tp"),
-                    "tp_label": sig.get("tp_label"), "sweep_t": sig.get("sweep_t"),
-                    "crt_t": sig.get("c1_t"), "reentry_t": sig.get("reentry_t"),
-                    "reentry_o": sig.get("reentry_o"), "reentry_h": sig.get("reentry_h"),
-                    "reentry_l": sig.get("reentry_l"), "reentry_c": sig.get("reentry_c"),
-                    "sweep_low": sig.get("sweep_low"), "range_high": sig.get("c1_high"),
-                    "range_low": sig.get("c1_low"), "fvg_t": sig.get("fvg_t"),
-                    "sweep_depth": (abs(float(sig.get("c1_low")) - float(sig.get("sweep_low")))
-                                    if sig.get("c1_low") is not None and sig.get("sweep_low") is not None else None),
-                    "range_size": (abs(float(sig.get("c1_high")) - float(sig.get("c1_low")))
-                                   if sig.get("c1_high") is not None and sig.get("c1_low") is not None else None),
-                    "sweep_depth_ratio": (abs(float(sig.get("c1_low")) - float(sig.get("sweep_low"))) /
-                                          abs(float(sig.get("c1_high")) - float(sig.get("c1_low")))
-                                          if None not in (sig.get("c1_low"), sig.get("sweep_low"), sig.get("c1_high"))
-                                          and abs(float(sig.get("c1_high")) - float(sig.get("c1_low"))) > 0 else None),
-                    "reentry_body_ratio": (abs(float(sig.get("reentry_c")) - float(sig.get("reentry_o"))) /
-                                           (float(sig.get("reentry_h")) - float(sig.get("reentry_l")))
-                                           if None not in (sig.get("reentry_o"), sig.get("reentry_h"), sig.get("reentry_l"), sig.get("reentry_c"))
-                                           and float(sig.get("reentry_h")) > float(sig.get("reentry_l")) else None),
-                    "reentry_close_location": (((float(sig.get("reentry_c")) - float(sig.get("reentry_l"))) /
-                                                 (float(sig.get("reentry_h")) - float(sig.get("reentry_l"))))
-                                                if sig.get("side") == "buy" and None not in (sig.get("reentry_c"), sig.get("reentry_l"), sig.get("reentry_h"))
-                                                and float(sig.get("reentry_h")) > float(sig.get("reentry_l")) else
-                                                (((float(sig.get("reentry_h")) - float(sig.get("reentry_c"))) /
-                                                  (float(sig.get("reentry_h")) - float(sig.get("reentry_l"))))
-                                                 if sig.get("side") == "sell" and None not in (sig.get("reentry_c"), sig.get("reentry_l"), sig.get("reentry_h"))
-                                                 and float(sig.get("reentry_h")) > float(sig.get("reentry_l")) else None)),
-                    "bias_d1": b_d1, "bias_h4": b_h4,
-                    "hour_utc": time.gmtime(T).tm_hour,
-                    "weekday_utc": time.gmtime(T).tm_wday,
-                    "bars_held": max(0, j - i) if isinstance(j, int) else None,
-                })
+                trades[thr].append({"side": sig["side"], "t": T, "res": res, "r": r, "rr": sig["rr"]})
                 busy[thr] = j
     return trades, st
 
 
-def performance_stats(trades):
-    """Mesures calculées sur les trades clôturés, dans l'ordre chronologique."""
-    ordered = sorted((t for t in trades if t["res"] != "open"), key=lambda t: t["t"])
-    rs = [float(t["r"]) for t in ordered]
-    gross_win = sum(r for r in rs if r > 0)
-    gross_loss = -sum(r for r in rs if r < 0)
-    equity = peak = max_dd = 0.0
-    loss_streak = win_streak = max_loss_streak = max_win_streak = 0
-    for r in rs:
-        equity += r
-        peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
-        if r < 0:
-            loss_streak += 1
-            win_streak = 0
-        elif r > 0:
-            win_streak += 1
-            loss_streak = 0
-        else:
-            loss_streak = win_streak = 0
-        max_loss_streak = max(max_loss_streak, loss_streak)
-        max_win_streak = max(max_win_streak, win_streak)
-    n = len(rs)
-    return {
-        "n_clos": n,
-        "expectancy_r": round(sum(rs) / n, 3) if n else 0.0,
-        "profit_factor": round(gross_win / gross_loss, 3) if gross_loss else (None if not gross_win else "inf"),
-        "max_drawdown_r": round(max_dd, 2),
-        "max_pertes_consecutives": max_loss_streak,
-        "max_gains_consecutifs": max_win_streak,
-        "sans_best1_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:1]), 2),
-        "sans_best2_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:2]), 2),
-        "sans_best3_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:3]), 2),
-        "sans_best5_r": round(sum(rs) - sum(sorted(rs, reverse=True)[:5]), 2),
-    }
-
-
 def summarize(sym, trades):
-    closed = [t for t in trades if t["res"] != "open"]
     w = sum(1 for t in trades if t["res"] == "win")
     l = sum(1 for t in trades if t["res"] == "loss")
     to = sum(1 for t in trades if t["res"] == "timeout")
     op = sum(1 for t in trades if t["res"] == "open")
-    total_r = sum(t["r"] for t in closed)
-    buys = [t for t in closed if t["side"] == "buy"]
-    sells = [t for t in closed if t["side"] == "sell"]
-    stats = performance_stats(closed)
-    buy_stats = performance_stats(buys)
-    sell_stats = performance_stats(sells)
+    total_r = sum(t["r"] for t in trades if t["res"] != "open")
+    buys = [t for t in trades if t["side"] == "buy" and t["res"] != "open"]
+    sells = [t for t in trades if t["side"] == "sell" and t["res"] != "open"]
     return {"symbole": label(sym), "achats": len(buys), "r_achats": round(sum(t["r"] for t in buys), 2),
-            "achats_pf": buy_stats["profit_factor"], "achats_dd_r": buy_stats["max_drawdown_r"],
-            "achats_expectancy_r": buy_stats["expectancy_r"],
-            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2),
-            "ventes_pf": sell_stats["profit_factor"], "ventes_dd_r": sell_stats["max_drawdown_r"],
-            "ventes_expectancy_r": sell_stats["expectancy_r"], "setups": len(trades),
-            "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2),
-            "profit_factor": stats["profit_factor"], "max_drawdown_r": stats["max_drawdown_r"],
-            "expectancy_r": stats["expectancy_r"]}
+            "ventes": len(sells), "r_ventes": round(sum(t["r"] for t in sells), 2), "setups": len(trades),
+            "gagnes": w, "perdus": l, "expires": to, "ouverts": op, "r_total": round(total_r, 2)}
 
 
-def combo_total(trades, window_start, window_end):
-    split_t = window_end - (window_end - window_start) / 3
-    # Les trades encore ouverts ne sont pas inclus dans les performances réalisées.
-    closed = sorted((t for t in trades if t["res"] != "open"), key=lambda t: t["t"])
+def combo_total(trades, split_t):
+    closed = [t for t in trades if t["res"] != "open"]
     old = [t for t in closed if t["t"] < split_t]
     new = [t for t in closed if t["t"] >= split_t]
-    total_r = sum(t["r"] for t in closed)
-    stats = performance_stats(closed)
-
-    # Trois périodes calendaires fixes sur la fenêtre complète du backtest,
-    # y compris les périodes sans aucun trade.
-    periods = []
-    span = max(1, window_end - window_start)
-    for idx in range(3):
-        lo = window_start + span * idx / 3
-        hi = window_start + span * (idx + 1) / 3
-        group = [t for t in closed if lo <= t["t"] < hi or (idx == 2 and t["t"] == window_end)]
-        periods.append({"n": len(group), "r": round(sum(t["r"] for t in group), 2)})
-
-    buys = performance_stats([t for t in closed if t["side"] == "buy"])
-    sells = performance_stats([t for t in closed if t["side"] == "sell"])
     return {"setups": len(trades),
             "gagnes": sum(1 for t in trades if t["res"] == "win"),
             "perdus": sum(1 for t in trades if t["res"] == "loss"),
             "expires": sum(1 for t in trades if t["res"] == "timeout"),
             "ouverts": sum(1 for t in trades if t["res"] == "open"),
-            "r_total": round(total_r, 2),
+            "r_total": round(sum(t["r"] for t in closed), 2),
             "n_old": len(old), "r_old": round(sum(t["r"] for t in old), 2),
-            "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2),
-            "periods": periods,
-            "profit_factor": stats["profit_factor"],
-            "expectancy_r": stats["expectancy_r"],
-            "max_drawdown_r": stats["max_drawdown_r"],
-            "max_pertes_consecutives": stats["max_pertes_consecutives"],
-            "max_gains_consecutifs": stats["max_gains_consecutifs"],
-            "sans_best1_r": stats["sans_best1_r"],
-            "sans_best2_r": stats["sans_best2_r"],
-            "sans_best3_r": stats["sans_best3_r"],
-            "sans_best5_r": stats["sans_best5_r"],
-            "achats_pf": buys["profit_factor"], "ventes_pf": sells["profit_factor"],
-            "achats_r": round(sum(t["r"] for t in closed if t["side"] == "buy"), 2),
-            "ventes_r": round(sum(t["r"] for t in closed if t["side"] == "sell"), 2)}
+            "n_new": len(new), "r_new": round(sum(t["r"] for t in new), 2)}
 
 
 async def hist_request(ws, payload):
@@ -1143,121 +936,7 @@ async def fetch_history(ws, sym, gran, target, page):
     return sorted(got.values(), key=lambda c: c["t"])
 
 
-BT_MODES = ("fvg",)
-BT_THRS = (0.0, 1.0, 1.5, 2.0)
-
-
-def trade_audit_groups(trades, key_fields):
-    """Regroupe les trades pour rechercher des causes récurrentes sans masquer les cas individuels."""
-    buckets = {}
-    for trade in trades:
-        key = tuple(trade.get(k) for k in key_fields)
-        buckets.setdefault(key, []).append(trade)
-    out = []
-    for key, group in sorted(buckets.items(), key=lambda item: tuple(str(x) for x in item[0])):
-        closed = [t for t in group if t.get("res") != "open"]
-        wins = sum(t.get("res") == "win" for t in group)
-        losses = sum(t.get("res") == "loss" for t in group)
-        total_r = round(sum(float(t.get("r", 0) or 0) for t in closed), 3)
-        gross_win = sum(float(t.get("r", 0) or 0) for t in closed if float(t.get("r", 0) or 0) > 0)
-        gross_loss = -sum(float(t.get("r", 0) or 0) for t in closed if float(t.get("r", 0) or 0) < 0)
-        out.append({**dict(zip(key_fields, key)), "trades": len(group), "gagnes": wins,
-                    "perdus": losses, "ouverts": sum(t.get("res") == "open" for t in group),
-                    "r_net": total_r, "esperance_r": round(total_r / len(closed), 3) if closed else 0.0,
-                    "pf": round(gross_win / gross_loss, 3) if gross_loss else ("inf" if gross_win else None)})
-    return out
-
-
-def history_coverage(candles, granularity, window_start, window_end):
-    """Couverture réelle dans la fenêtre, trous et chevauchement observés."""
-    inside = [c for c in candles if window_start <= int(c["t"]) < window_end]
-    if not inside:
-        return {"n": 0, "debut": None, "fin_cloture": None,
-                "couverture_pct": 0.0, "trous": 0, "plus_grand_trou_bougies": 0}
-    ts = sorted(set(int(c["t"]) for c in inside))
-    expected = max(1, int((window_end - window_start) // granularity))
-    missing = []
-    for a, b in zip(ts, ts[1:]):
-        gap = max(0, int((b - a) // granularity) - 1)
-        if gap:
-            missing.append(gap)
-    return {"n": len(ts), "debut": ts[0], "fin_cloture": ts[-1] + granularity,
-            "couverture_pct": round(min(100.0, len(ts) / expected * 100.0), 1),
-            "trous": len(missing), "plus_grand_trou_bougies": max(missing) if missing else 0}
-
-
-def _closed_segment(trades, start_t, end_t):
-    return [t for t in trades if t.get("res") != "open" and start_t <= int(t.get("t", 0)) < end_t]
-
-
-def _stats_adjusted(trades, costs):
-    adjusted = []
-    total_cost = 0.0
-    for t in trades:
-        if t.get("res") == "open":
-            continue
-        row = dict(t)
-        cost = costs(t) if callable(costs) else float(costs)
-        row["r"] = float(t.get("r", 0) or 0) - cost
-        total_cost += cost
-        adjusted.append(row)
-    stats = performance_stats(adjusted)
-    stats.update({"trades": len(adjusted), "r_net": round(sum(float(t.get("r", 0) or 0) for t in adjusted), 3),
-                  "cout_total_r": round(total_cost, 3)})
-    return stats
-
-
-def _load_cost_config():
-    try:
-        default_cost = max(0.0, float(os.environ.get("BT_COST_R", "0")))
-    except (TypeError, ValueError):
-        default_cost = 0.0
-    try:
-        raw = json.loads(os.environ.get("BT_COST_R_BY_SYMBOL", "{}"))
-        by_symbol = {str(k): max(0.0, float(v)) for k, v in raw.items()} if isinstance(raw, dict) else {}
-    except (ValueError, TypeError, AttributeError):
-        by_symbol = {}
-    return default_cost, by_symbol
-
-
-def _chronological_validation(trades, window_start, window_end):
-    split_t = int(window_start + (window_end - window_start) * 2 / 3)
-    dev = _closed_segment(trades, window_start, split_t)
-    holdout = _closed_segment(trades, split_t, window_end)
-    return {"date_separation_utc": split_t,
-            "developpement_premiers_2_3": _stats_adjusted(dev, 0.0),
-            "hors_echantillon_dernier_tiers": _stats_adjusted(holdout, 0.0),
-            "note": "Découpage chronologique strict. Le dernier tiers est réservé à la validation et ne sert pas à choisir les règles."}
-
-
-def _cost_sensitivity(trades, window_start, window_end, default_cost, by_symbol):
-    split_t = int(window_start + (window_end - window_start) * 2 / 3)
-    holdout = _closed_segment(trades, split_t, window_end)
-    configured = _stats_adjusted(holdout, lambda t: by_symbol.get(t.get("sym"), default_cost))
-    stress = []
-    for cost in (0.02, 0.05, 0.10):
-        st = _stats_adjusted(holdout, cost)
-        stress.append({"cout_r_par_trade": cost, **st})
-    return {"periode": "dernier_tiers_hors_echantillon", "couts_configures": configured,
-            "cout_par_defaut_r": default_cost, "couts_par_marche_r": by_symbol,
-            "scenarios_stress": stress,
-            "avertissement": "Les scénarios 0.02/0.05/0.10 R sont des sensibilités, pas des spreads mesurés. Les coûts réalistes doivent être calibrés avec spread, commission et slippage observés par marché."}
-
-
-def _quality_class(value, a, b, labels):
-    if value is None:
-        return "inconnu"
-    return labels[0] if value < a else (labels[1] if value < b else labels[2])
-
-
-def enrich_trade_quality(trades):
-    for t in trades:
-        t["sweep_depth_classe"] = _quality_class(t.get("sweep_depth_ratio"), 0.05, 0.15,
-                                                 ("faible", "moyen", "profond"))
-        t["reentry_body_classe"] = _quality_class(t.get("reentry_body_ratio"), 0.25, 0.60,
-                                                  ("petit_corps", "corps_moyen", "grand_corps"))
-        loc = t.get("reentry_close_location")
-        t["reentry_close_classe"] = "inconnu" if loc is None else ("cloture_defavorable" if loc < 0.5 else "cloture_favorable")
+BT_THRS = (1.0, 1.5, 2.0)
 
 
 async def run_backtest():
@@ -1267,36 +946,24 @@ async def run_backtest():
     try:
         http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
         ws = await http.ws_connect(PUBLIC_WS, heartbeat=25)
-        rows = {(m, t): [] for m in BT_MODES for t in BT_THRS}
-        alltr = {(m, t): [] for m in BT_MODES for t in BT_THRS}
-        funnel = {m: {"steps": 0, "bias": 0, "zone": 0, "crt": 0, "fvg": 0, "rr": 0} for m in BT_MODES}
-        split_t = 0
-        # Fenêtre UTC figée une seule fois au lancement : aucune donnée future ne peut entrer.
+        rows = {t: [] for t in BT_THRS}
+        alltr = {t: [] for t in BT_THRS}
+        funnel = {"steps": 0, "crt": 0, "fvg": 0, "rr": 0}
         window_end = int(time.time() // 900) * 900
-        window_start = window_end - BT_DAYS * 86400
+        start_t = window_end - BT_DAYS * 86400
+        split_t = window_end - (BT_DAYS // 3) * 86400
         n_ok = 0
-        coverage = {}
         for n, sym in enumerate(SYMBOLS):
             tag = "%d/%d %s" % (n + 1, len(SYMBOLS), sym)
             BT["progress"] = tag + " : téléchargement des bougies..."
             err = None
             try:
-                d1_raw = await fetch_history(ws, real(sym), 86400, 400, 400)
-                h4_raw = await fetch_history(ws, real(sym), 14400, 1500, 1500)
-                m15_raw = await fetch_history(ws, real(sym), 900, (BT_DAYS + 4) * 96, 4000)
-                # Toutes les unités sont arrêtées à LA MÊME borne fixe du backtest.
-                # Une bougie est admissible uniquement si sa clôture est <= window_end.
-                d1 = [c for c in d1_raw if int(c["t"]) + 86400 <= window_end]
-                h4 = [c for c in h4_raw if int(c["t"]) + 14400 <= window_end]
-                m15 = [c for c in m15_raw if int(c["t"]) + 900 <= window_end]
-                coverage[sym] = {
-                    "D1": history_coverage(d1_raw, 86400, window_start, window_end),
-                    "H4": history_coverage(h4_raw, 14400, window_start, window_end),
-                    "M15": history_coverage(m15, 900, window_start, window_end),
-                    "M15_warmup_avant_debut": sum(1 for c in m15 if int(c["t"]) < window_start),
-                }
+                h4 = await fetch_history(ws, real(sym), 14400, (BT_DAYS + 30) * 6, 4000)
+                m15 = await fetch_history(ws, real(sym), 900, (BT_DAYS + 4) * 96, 4000)
+                # Ne jamais traiter la bougie M15 encore en formation comme clôturée.
+                m15 = [c for c in m15 if int(c["t"]) + 900 <= int(time.time())]
                 if len(m15) < 400:
-                    err = "pas assez d'historique M15 clôturé avant la borne fixe (%d bougies)" % len(m15)
+                    err = "pas assez d'historique (%d bougies M15)" % len(m15)
             except ApiError as e:
                 err = str(e)
             if err:
@@ -1304,72 +971,19 @@ async def run_backtest():
                     rows[k].append({"symbole": label(sym), "erreur": err})
                 continue
             n_ok += 1
-            split_t = window_end - (BT_DAYS // 3) * 86400
-            start_t = window_start
-            start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), None)
-            if start_i is None:
-                coverage[sym]["erreur_fenetre"] = "aucune bougie M15 dans la fenêtre demandée"
-                for k in rows:
-                    rows[k].append({"symbole": label(sym), "erreur": coverage[sym]["erreur_fenetre"]})
-                n_ok -= 1
-                continue
-            coverage[sym]["premiere_bougie_analysee"] = int(m15[start_i]["t"])
-            coverage[sym]["derniere_bougie_analysee_cloture"] = int(m15[-1]["t"] + 900) if m15 else None
-            coverage[sym]["retard_debut_jours"] = round(max(0, int(m15[start_i]["t"]) - window_start) / 86400, 2)
-            for mode in BT_MODES:
-                BT["progress"] = tag + " : analyse (" + mode + ")..."
-                trs, st = await replay(d1, h4, m15, start_i, SIDE_ONLY.get(sym), mode, BT_THRS)
-                for thr in BT_THRS:
-                    rows[(mode, thr)].append(summarize(sym, trs[thr]))
-                    for trade in trs[thr]:
-                        trade["sym"] = sym
-                    alltr[(mode, thr)].extend(trs[thr])
-                f = funnel[mode]
-                f["steps"] += st["steps"]
-                f["bias"] += st["bias"]
-                f["zone"] += st["zone"]
-                f["crt"] += len(st["crt"])
-                f["fvg"] += len(st["fvg"])
-                f["rr"] += len(st["rr"])
-        refresh_market_history(alltr)
-        default_cost_r, cost_by_symbol = _load_cost_config()
-        combos = []
-        for mode in BT_MODES:
+            start_i = next((i for i, c in enumerate(m15) if c["t"] >= start_t), 0)
+            BT["progress"] = tag + " : analyse..."
+            trs, st = await replay(h4, m15, start_i, SIDE_ONLY.get(sym), BT_THRS)
             for thr in BT_THRS:
-                combo_trades = alltr[(mode, thr)]
-                combo_rows = rows[(mode, thr)]
-                aggregate = combo_total(combo_trades, window_start, window_end)
-                row_setups = sum(int(x.get("setups", 0)) for x in combo_rows if "erreur" not in x)
-                outcome_sum = aggregate["gagnes"] + aggregate["perdus"] + aggregate["expires"] + aggregate["ouverts"]
-                combos.append({"mode": mode, "min_rr": thr, "total": aggregate,
-                               "validation_chronologique": _chronological_validation(combo_trades, window_start, window_end),
-                               "sensibilite_couts_hors_echantillon": _cost_sensitivity(combo_trades, window_start, window_end, default_cost_r, cost_by_symbol),
-                               "reconciliation": {"trades_internes": len(combo_trades),
-                                                  "setups_lignes_marches": row_setups,
-                                                  "somme_resultats": outcome_sum,
-                                                  "ecart_trades_vs_lignes": len(combo_trades) - row_setups,
-                                                  "ecart_resultats_vs_setups": len(combo_trades) - outcome_sum},
-                               "lignes": combo_rows})
-        primary_audit = alltr[("fvg", 0.0)]
-        enrich_trade_quality(primary_audit)
-        losses_audit = [t for t in primary_audit if t.get("res") == "loss"]
-        BT["results"] = {"version": "V7", "strategie_reference": "Fibonacci H4 OTE 62-79; CRT H4; FVG M15 rejet; SL ATR; TP liquidité H4/D1; trailing FVG M15",
-                         "jours": BT_DAYS, "jours_new": BT_DAYS // 3,
-                         "fenetre_debut_utc": window_start, "fenetre_fin_utc": window_end,
-                         "bougies_m15_incompletes_exclues": True, "borne_commune_toutes_unites": True,
-                         "marches": n_ok, "couverture_historique": coverage,
-                         "audit_trades_v7": primary_audit,
-                         "audit_pertes_v7": losses_audit,
-                         "audit_par_marche": trade_audit_groups(primary_audit, ("sym",)),
-                         "audit_par_marche_direction": trade_audit_groups(primary_audit, ("sym", "side")),
-                         "audit_par_heure_utc": trade_audit_groups(primary_audit, ("hour_utc",)),
-                         "audit_par_biais": trade_audit_groups(primary_audit, ("bias_d1", "bias_h4")),
-                         "audit_par_profondeur_sweep": trade_audit_groups(primary_audit, ("sweep_depth_classe",)),
-                         "audit_par_qualite_reintegration": trade_audit_groups(primary_audit, ("reentry_body_classe", "reentry_close_classe")),
-                         "mode_validation": "premiers 2/3 développement; dernier tiers hors échantillon chronologique",
-                         "couts_reels_verifies": False,
-                         "couts_configures": {"BT_COST_R": default_cost_r, "BT_COST_R_BY_SYMBOL": cost_by_symbol},
-                         "note_couts": "Sensibilités incluses; les coûts réels doivent être calibrés par marché avec spread, commission et slippage observés.",
+                rows[thr].append(summarize(sym, trs[thr]))
+                alltr[thr].extend(trs[thr])
+            funnel["steps"] += st["steps"]
+            funnel["crt"] += len(st["crt"])
+            funnel["fvg"] += len(st["fvg"])
+            funnel["rr"] += len(st["rr"])
+        combos = [{"min_rr": thr, "total": combo_total(alltr[thr], split_t), "lignes": rows[thr]}
+                  for thr in BT_THRS]
+        BT["results"] = {"jours": BT_DAYS, "jours_new": BT_DAYS // 3, "marches": n_ok,
                          "entonnoir": funnel, "combos": combos}
         BT["done"] = True
         BT["progress"] = "terminé"
@@ -1397,7 +1011,6 @@ async def on_cleanup(app):
     task = app.get("scanner")
     if task:
         task.cancel()
-
         try:
             await task
         except asyncio.CancelledError:
