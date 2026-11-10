@@ -1186,8 +1186,20 @@ async def fetch_history(ws, sym, gran, target, page):
     for _ in range(max(8, (target + page - 1) // page + 2)):
         data = await hist_request(ws, {"ticks_history": sym, "end": end, "style": "candles",
                                        "granularity": gran, "count": page})
+        
         cs = norm_candles(data.get("candles"))
+
         fresh = [c for c in cs if c["t"] not in got]
+
+        print(
+            f"[HIST] sym={sym} gran={gran} end={end} "
+            f"reçues={len(cs)} nouvelles={len(fresh)} "
+            f"plus_ancienne={cs[0]['t'] if cs else None} "
+            f"plus_récente={cs[-1]['t'] if cs else None}"
+        )
+
+        for c in cs:
+            got[c["t"]] = c
         for c in cs:
             got[c["t"]] = c
         if not cs or len(got) >= target or len(fresh) <= 1:
