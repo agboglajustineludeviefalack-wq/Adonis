@@ -1198,8 +1198,7 @@ async def fetch_history(ws, sym, gran, target, page):
             f"plus_récente={cs[-1]['t'] if cs else None}"
         )
 
-        for c in cs:
-            got[c["t"]] = c
+
         for c in cs:
             got[c["t"]] = c
         if not cs or len(got) >= target or len(fresh) <= 1:
