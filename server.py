@@ -1183,7 +1183,7 @@ async def hist_request(ws, payload):
 async def fetch_history(ws, sym, gran, target, page):
     got = {}
     end = "latest"
-    for _ in range(8):
+    for _ in range(max(8, (target + page - 1) // page + 2)):
         data = await hist_request(ws, {"ticks_history": sym, "end": end, "style": "candles",
                                        "granularity": gran, "count": page})
         cs = norm_candles(data.get("candles"))
